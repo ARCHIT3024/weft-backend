@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, UploadFile, status
 
 from app.config import settings
 from app.core.captcha import verify_captcha
@@ -44,7 +44,7 @@ from app.schemas.issue import (
     NearbyIssue,
     UpdateIssueStatusRequest,
 )
-from app.services import image_service, issue_service
+from app.services import image_service, issue_service, notification_service
 
 logger = logging.getLogger(__name__)
 
@@ -285,15 +285,22 @@ async def update_issue_status(
     issue_id: uuid.UUID,
     payload: UpdateIssueStatusRequest,
     current_user: AuthorityUserDep,
+    background_tasks: BackgroundTasks,
 ) -> IssueDetail:
-    """Authority triage. Illegal transitions are refused, not silently applied."""
-    await issue_service.update_status(
+    """Authority triage. Illegal transitions are refused, not silently applied.
+
+    The reporter's notification (task 1.21/1.25) is queued as a background
+    task: it runs after the response, after the request session has committed,
+    and can never fail the status change. Anonymous issues notify nobody.
+    """
+    issue = await issue_service.update_status(
         db,
         issue_id=issue_id,
         new_status=payload.status.value,
         actor=current_user,
         note=payload.note,
     )
+    notification_service.schedule_status_change_notification(background_tasks, db, issue=issue, actor=current_user)
     return await get_issue(db, issue_id)
 
 

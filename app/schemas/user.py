@@ -16,6 +16,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.common import IDMixin
 
+# FCM registration tokens are ~160 characters today. The ceiling is generous
+# headroom for a format change, not a guess at the real length — it exists so a
+# client cannot park megabytes in a TEXT column through a profile update.
+FCM_TOKEN_MAX_LENGTH = 4096
+
 # ── Enums ───────────────────────────────────────────────────────────────
 
 
@@ -104,13 +109,28 @@ class UpdateProfileRequest(BaseModel):
     """Partial update of the caller's own profile.
 
     Mirrors the inline request body of `updateMyProfile`. Every field is
-    optional; omitted fields are left unchanged.
+    optional; an omitted field — or one sent as `null` — is left unchanged.
+    Clearing a field is not an operation this endpoint offers.
+
+    **Unknown fields are rejected (422), not ignored.** The field is
+    `fcm_token`; implementation-plan task 2.31 calls it "device_token" in
+    prose. A client that sent `device_token` to a lenient model would get a
+    200 and never receive a push, with nothing anywhere to say why. Rejecting
+    the unknown key turns that silent failure into one the client developer
+    sees on the first call.
+
+    `phone` and `email` are not editable here: both are login identifiers and
+    unique, and changing one without verifying the new value would let an
+    account claim an address it does not control.
     """
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     name: str | None = Field(
         default=None,
+        min_length=1,
         max_length=100,
-        description="New display name",
+        description="New display name; surrounding whitespace is stripped and a blank name is rejected",
         examples=["Updated Name"],
     )
     preferred_lang: PreferredLanguage | None = Field(
@@ -120,5 +140,8 @@ class UpdateProfileRequest(BaseModel):
     )
     fcm_token: str | None = Field(
         default=None,
-        description="Firebase Cloud Messaging device token for push notifications",
+        min_length=1,
+        max_length=FCM_TOKEN_MAX_LENGTH,
+        description="Firebase Cloud Messaging registration token for this device. Send it on every app "
+        "launch; it registers the device for push and moves it to the caller if another account had it.",
     )

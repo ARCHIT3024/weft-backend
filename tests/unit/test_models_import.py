@@ -31,6 +31,8 @@ from app.models import (
     AuthorityZone,
     Department,
     DepartmentCategory,
+    FcmToken,
+    Notification,
     RefreshToken,
     User,
     Zone,
@@ -156,3 +158,30 @@ def test_zone_boundary_is_polygon_4326() -> None:
     assert col.type.srid == 4326
     index_names = {ix.name for ix in Zone.__table__.indexes}
     assert "idx_zones_boundary" in index_names
+
+
+def test_notification_models_are_exported() -> None:
+    """Tasks 1.25/1.26 — both tables must be visible to Alembic autogenerate."""
+    assert {"FcmToken", "Notification"} <= set(models_pkg.__all__)
+    assert {"user_fcm_tokens", "notifications"} <= set(Base.metadata.tables)
+
+
+def test_device_token_has_exactly_one_owner() -> None:
+    """`UNIQUE (device_token)` is the upsert target that moves a token between users."""
+    assert FcmToken.__table__.columns["device_token"].unique is True
+    assert FcmToken.__table__.columns["user_id"].nullable is False
+
+
+def test_notification_enums_reuse_the_migration_002_types() -> None:
+    """`create_type=False`, or SQLAlchemy would emit a second CREATE TYPE."""
+    for column, type_name in (("type", "notification_type"), ("channel", "notification_channel")):
+        enum_type = Notification.__table__.columns[column].type
+        assert enum_type.name == type_name
+        assert enum_type.create_type is False
+
+
+def test_notification_issue_link_survives_issue_deletion() -> None:
+    """ON DELETE SET NULL: deleting an issue must not erase what its reporter was told."""
+    (fk,) = Notification.__table__.columns["issue_id"].foreign_keys
+    assert fk.ondelete == "SET NULL"
+    assert Notification.__table__.columns["issue_id"].nullable is True
