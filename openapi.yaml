@@ -1,0 +1,1126 @@
+openapi: "3.0.3"
+info:
+  title: Weft API
+  description: |
+    Crowdsourced Civic Issue Reporting Platform.
+    All endpoints are prefixed with `/v1`.
+  version: "1.0.0"
+  contact:
+    name: Weft Engineering
+    url: https://weft.city
+
+servers:
+  - url: http://localhost:8000/v1
+    description: Local development
+  - url: https://api.weft.city/v1
+    description: Production
+
+tags:
+  - name: Auth
+    description: Authentication & OAuth
+  - name: Issues
+    description: Civic issue reporting & management
+  - name: Upvotes
+    description: Community upvoting
+  - name: Users
+    description: User profiles & leaderboard
+  - name: Notifications
+    description: Push & in-app notifications
+  - name: Analytics
+    description: Authority dashboard analytics
+  - name: Admin
+    description: System administration (admin role)
+  - name: WebSocket
+    description: Real-time dashboard events
+  - name: Health
+    description: Health check
+
+paths:
+  # ── Health ──────────────────────────────────────────────────────────
+  /health:
+    get:
+      tags: [Health]
+      summary: Application health check
+      operationId: healthCheck
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  # ── Auth ────────────────────────────────────────────────────────────
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new citizen account
+      operationId: registerCitizen
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "201":
+          description: Account created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterResponse"
+        "409":
+          description: Email already registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Login with email + password
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: >-
+            Login successful. Both tokens are returned in the body; no cookie
+            is set.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /auth/oauth/google:
+    post:
+      tags: [Auth]
+      summary: Google OAuth sign-in
+      operationId: googleOAuth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id_token]
+              properties:
+                id_token:
+                  type: string
+                  description: Google ID token from mobile/web SDK
+      responses:
+        "200":
+          description: >-
+            OAuth successful. Both tokens are returned in the body; no cookie
+            is set.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+
+  /auth/oauth/apple:
+    post:
+      tags: [Auth]
+      summary: Apple OAuth sign-in
+      operationId: appleOAuth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [authorization_code]
+              properties:
+                authorization_code:
+                  type: string
+                name:
+                  type: string
+                  description: Full name (Apple provides only on first auth)
+      responses:
+        "200":
+          description: >-
+            OAuth successful. Both tokens are returned in the body; no cookie
+            is set.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Rotate refresh token and get new access token
+      description: >-
+        Takes the refresh token from the JSON body. There is no cookie
+        channel: no cookie is read, and none is set. Every client — Flutter and
+        the React dashboard alike — holds the token itself and sends it here.
+
+        The presented token is revoked in the same transaction that issues its
+        replacement, so a refresh token is never valid twice. Both a new access
+        token and a new refresh token are always returned: clients replace the
+        stored refresh token on every rotation, so returning only one of them
+        would silently end the session.
+
+        Omitting `refresh_token` is a 400 (`MISSING_REFRESH_TOKEN`); an
+        unknown, expired, already-rotated or revoked token is a 401, as is a
+        token whose owner has been deactivated. The request body itself may be
+        omitted entirely, which is the same 400 — the field is not declared
+        `required` so that the missing-token case is a domain error rather than
+        a schema-validation 422.
+      operationId: refreshToken
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refresh_token:
+                  type: string
+                  description: >-
+                    Opaque refresh token issued by login or by a previous
+                    rotation. Absent or empty is a 400.
+      responses:
+        "200":
+          description: >-
+            Token rotated. A new access token and a new refresh token are both
+            returned in the body; no cookie is set.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+        "400":
+          description: No refresh_token supplied in the body
+        "401":
+          description: Invalid, expired or revoked refresh token
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke a refresh token (single device)
+      description: >-
+        Revokes one refresh token, ending the session on that device only. The
+        token to revoke is supplied in the JSON body; there is no cookie
+        channel, and none is set or cleared. The access token's `jti`
+        identifies the access token, not the refresh token, so the token to
+        revoke cannot be inferred and must be named explicitly.
+
+        Deliberately unauthenticated — no `Authorization` header is required
+        or inspected. Possession of the 64-byte refresh token is itself the
+        proof, and demanding a live access token would make an expired session
+        impossible to revoke, which is exactly when revocation matters.
+
+        Idempotent by construction: an unknown token, an already-revoked
+        token, an empty body and no body at all all return 204, so the
+        response is never an oracle for which tokens exist.
+      operationId: logout
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refresh_token:
+                  type: string
+                  description: >-
+                    Refresh token to revoke. Omitting it is not an error — the
+                    call succeeds and revokes nothing.
+      responses:
+        "204":
+          description: >-
+            Token revoked, or no matching token existed. Indistinguishable by
+            design.
+
+  # ── Issues ──────────────────────────────────────────────────────────
+  /issues:
+    post:
+      tags: [Issues]
+      summary: Submit a new civic issue
+      operationId: createIssue
+      security:
+        - BearerAuth: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/CreateIssueRequest"
+      responses:
+        "201":
+          description: Issue created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateIssueResponse"
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+    get:
+      tags: [Issues]
+      summary: List issues with filters
+      operationId: listIssues
+      parameters:
+        - name: lat
+          in: query
+          schema: { type: number, format: double }
+        - name: lng
+          in: query
+          schema: { type: number, format: double }
+        - name: radius_m
+          in: query
+          schema: { type: integer, default: 2000, maximum: 10000 }
+        - name: category
+          in: query
+          schema: { type: array, items: { $ref: "#/components/schemas/IssueCategory" } }
+        - name: status
+          in: query
+          schema: { type: array, items: { $ref: "#/components/schemas/IssueStatus" } }
+        - name: min_upvotes
+          in: query
+          schema: { type: integer }
+        - name: from_date
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to_date
+          in: query
+          schema: { type: string, format: date-time }
+        - name: zone_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1, minimum: 1 }
+        - name: page_size
+          in: query
+          schema: { type: integer, default: 20, minimum: 1, maximum: 100 }
+        - name: sort_by
+          in: query
+          schema: { type: string, enum: [created_at, upvote_count], default: created_at }
+        - name: sort_dir
+          in: query
+          schema: { type: string, enum: [asc, desc], default: desc }
+      responses:
+        "200":
+          description: Paginated issue list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedIssueResponse"
+
+  /issues/nearby:
+    get:
+      tags: [Issues]
+      summary: Get issues near a location
+      operationId: nearbyIssues
+      parameters:
+        - name: lat
+          in: query
+          required: true
+          schema: { type: number, format: double }
+        - name: lng
+          in: query
+          required: true
+          schema: { type: number, format: double }
+        - name: radius_m
+          in: query
+          schema: { type: integer, default: 2000, maximum: 10000 }
+      responses:
+        "200":
+          description: Nearby issues with distance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedIssueResponse"
+
+  /issues/{issue_id}:
+    get:
+      tags: [Issues]
+      summary: Get full issue detail
+      operationId: getIssue
+      parameters:
+        - $ref: "#/components/parameters/IssueId"
+      responses:
+        "200":
+          description: Issue detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssueDetail"
+        "404":
+          description: Issue not found
+
+  /issues/{issue_id}/status:
+    patch:
+      tags: [Issues]
+      summary: Update issue status (authority only)
+      operationId: updateIssueStatus
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IssueId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  $ref: "#/components/schemas/IssueStatus"
+                note:
+                  type: string
+                  maxLength: 500
+      responses:
+        "200":
+          description: Status updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssueDetail"
+        "403":
+          description: Insufficient permissions
+
+  /issues/{issue_id}/assign:
+    patch:
+      tags: [Issues]
+      summary: Assign issue to field worker (authority only)
+      operationId: assignIssue
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IssueId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [assigned_to_id]
+              properties:
+                assigned_to_id:
+                  type: string
+                  format: uuid
+      responses:
+        "200":
+          description: Issue assigned
+
+  /issues/{issue_id}/images:
+    post:
+      tags: [Issues]
+      summary: Upload resolution proof photo (authority only)
+      operationId: uploadResolutionProof
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IssueId"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image:
+                  type: string
+                  format: binary
+      responses:
+        "201":
+          description: Image uploaded
+
+  # ── Upvotes ─────────────────────────────────────────────────────────
+  /issues/{issue_id}/upvote:
+    post:
+      tags: [Upvotes]
+      summary: Upvote an open issue
+      operationId: upvoteIssue
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IssueId"
+      responses:
+        "201":
+          description: Upvote recorded
+        "409":
+          description: Already upvoted
+
+    delete:
+      tags: [Upvotes]
+      summary: Remove upvote
+      operationId: removeUpvote
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IssueId"
+      responses:
+        "204":
+          description: Upvote removed
+
+  # ── Users ───────────────────────────────────────────────────────────
+  /users/me:
+    get:
+      tags: [Users]
+      summary: Get own profile + trust score
+      operationId: getMyProfile
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: User profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserProfile"
+
+    patch:
+      tags: [Users]
+      summary: Update profile (name, lang, FCM token)
+      operationId: updateMyProfile
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  maxLength: 100
+                preferred_lang:
+                  type: string
+                  enum: [en, hi, ta, te, mr, bn]
+                fcm_token:
+                  type: string
+      responses:
+        "200":
+          description: Profile updated
+
+  /users/me/reports:
+    get:
+      tags: [Users]
+      summary: Get own submitted issues
+      operationId: getMyReports
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Paginated list of user's issues
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedIssueResponse"
+
+  /users/leaderboard:
+    get:
+      tags: [Users]
+      summary: Monthly top-contributor leaderboard
+      operationId: getLeaderboard
+      responses:
+        "200":
+          description: Leaderboard entries
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LeaderboardResponse"
+
+  # ── Notifications ───────────────────────────────────────────────────
+  /notifications:
+    get:
+      tags: [Notifications]
+      summary: Get notification list for current user
+      operationId: listNotifications
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Notification list
+
+  /notifications/{notification_id}/read:
+    patch:
+      tags: [Notifications]
+      summary: Mark notification as read
+      operationId: markNotificationRead
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: notification_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Marked as read
+
+  /notifications/read-all:
+    patch:
+      tags: [Notifications]
+      summary: Mark all notifications as read
+      operationId: markAllNotificationsRead
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: All marked as read
+
+  # ── Analytics ───────────────────────────────────────────────────────
+  /analytics/summary:
+    get:
+      tags: [Analytics]
+      summary: KPI summary (authority only)
+      operationId: analyticsSummary
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: KPI data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnalyticsSummary"
+
+  /analytics/heatmap:
+    get:
+      tags: [Analytics]
+      summary: Geo-aggregated issue density for map
+      operationId: analyticsHeatmap
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Heatmap grid points
+
+  /analytics/resolution-times:
+    get:
+      tags: [Analytics]
+      summary: Avg resolution time per category/dept
+      operationId: analyticsResolutionTimes
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Resolution time data
+
+  /analytics/sla-breaches:
+    get:
+      tags: [Analytics]
+      summary: Issues exceeding SLA threshold
+      operationId: analyticsSlaBreaches
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: SLA breach list
+
+  /analytics/export:
+    get:
+      tags: [Analytics]
+      summary: CSV or PDF export
+      operationId: analyticsExport
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: format
+          in: query
+          schema: { type: string, enum: [csv, pdf], default: csv }
+      responses:
+        "200":
+          description: File download
+
+  # ── Admin ───────────────────────────────────────────────────────────
+  /admin/authority-users:
+    post:
+      tags: [Admin]
+      summary: Create a new authority account
+      operationId: createAuthorityUser
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAuthorityRequest"
+      responses:
+        "201":
+          description: Authority account created
+
+  /admin/authority-users/{user_id}/deactivate:
+    patch:
+      tags: [Admin]
+      summary: Deactivate authority account
+      operationId: deactivateAuthorityUser
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Account deactivated
+
+  /admin/departments:
+    get:
+      tags: [Admin]
+      summary: List all departments
+      operationId: listDepartments
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Department list
+
+    post:
+      tags: [Admin]
+      summary: Create a new department
+      operationId: createDepartment
+      security:
+        - BearerAuth: []
+      responses:
+        "201":
+          description: Department created
+
+  /admin/zones:
+    post:
+      tags: [Admin]
+      summary: Create a new geographic zone
+      operationId: createZone
+      security:
+        - BearerAuth: []
+      responses:
+        "201":
+          description: Zone created
+
+  /admin/system/stats:
+    get:
+      tags: [Admin]
+      summary: System-wide usage statistics
+      operationId: systemStats
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: System stats
+
+# ═══════════════════════════════════════════════════════════════════════
+# Components
+# ═══════════════════════════════════════════════════════════════════════
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: RS256 signed JWT access token (24h expiry)
+
+  parameters:
+    IssueId:
+      name: issue_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Issue UUID
+
+  schemas:
+    # ── Enums ─────────────────────────────────────────────────────────
+    UserRole:
+      type: string
+      enum: [CITIZEN, AUTHORITY, ADMIN]
+
+    IssueStatus:
+      type: string
+      enum: [REPORTED, IN_PROGRESS, RESOLVED, REJECTED]
+
+    IssueCategory:
+      type: string
+      enum:
+        - POTHOLE
+        - GARBAGE_ACCUMULATION
+        - WATER_LOGGING
+        - BROKEN_STREET_LIGHT
+        - DAMAGED_FOOTPATH
+        - SEWAGE_OVERFLOW
+        - OTHER
+
+    # ── Auth ──────────────────────────────────────────────────────────
+    RegisterRequest:
+      type: object
+      required: [email, password, name]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+        name:
+          type: string
+          maxLength: 100
+        phone:
+          type: string
+
+    RegisterResponse:
+      type: object
+      required: [user_id, email, name, role, created_at]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        name:
+          type: string
+        role:
+          $ref: "#/components/schemas/UserRole"
+        created_at:
+          type: string
+          format: date-time
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+
+    AuthResponse:
+      type: object
+      # `token_type` is omitted: it carries a default ("bearer") and so is not
+      # required on the wire, exactly as the app's generated schema reports it.
+      required: [access_token, refresh_token, expires_in, user]
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        token_type:
+          type: string
+          enum: [bearer]
+        expires_in:
+          type: integer
+          description: Access token expiry in seconds
+        user:
+          $ref: "#/components/schemas/UserProfile"
+
+    TokenResponse:
+      type: object
+      # Both tokens are always returned by /auth/refresh; a client that treated
+      # refresh_token as optional would drop the rotated token and lose the
+      # session on the next call.
+      required: [access_token, refresh_token, expires_in]
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        token_type:
+          type: string
+        expires_in:
+          type: integer
+
+    # ── Issues ────────────────────────────────────────────────────────
+    CreateIssueRequest:
+      type: object
+      required: [category, latitude, longitude, image]
+      properties:
+        category:
+          $ref: "#/components/schemas/IssueCategory"
+        description:
+          type: string
+          maxLength: 500
+        latitude:
+          type: number
+          format: double
+          minimum: -90
+          maximum: 90
+        longitude:
+          type: number
+          format: double
+          minimum: -180
+          maximum: 180
+        image:
+          type: string
+          format: binary
+        captcha_token:
+          type: string
+          description: Required for anonymous submissions
+        captured_at:
+          type: string
+          format: date-time
+          description: When photo was captured (for offline submissions)
+
+    CreateIssueResponse:
+      type: object
+      properties:
+        issue_id:
+          type: string
+          format: uuid
+        issue_number:
+          type: string
+          example: "ISS-2025-00412"
+        status:
+          $ref: "#/components/schemas/IssueStatus"
+        category:
+          $ref: "#/components/schemas/IssueCategory"
+        ai_suggested_category:
+          $ref: "#/components/schemas/IssueCategory"
+        ai_confidence:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        latitude:
+          type: number
+        longitude:
+          type: number
+        address_text:
+          type: string
+        image_url:
+          type: string
+          format: uri
+        created_at:
+          type: string
+          format: date-time
+
+    IssueDetail:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        issue_number:
+          type: string
+        category:
+          $ref: "#/components/schemas/IssueCategory"
+        description:
+          type: string
+        status:
+          $ref: "#/components/schemas/IssueStatus"
+        latitude:
+          type: number
+        longitude:
+          type: number
+        address_text:
+          type: string
+        zone_id:
+          type: string
+          format: uuid
+        department_id:
+          type: string
+          format: uuid
+        ai_suggested_category:
+          $ref: "#/components/schemas/IssueCategory"
+        ai_confidence:
+          type: number
+        upvote_count:
+          type: integer
+        assigned_to_id:
+          type: string
+          format: uuid
+          nullable: true
+        assigned_at:
+          type: string
+          format: date-time
+          nullable: true
+        resolved_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        images:
+          type: array
+          items:
+            $ref: "#/components/schemas/IssueImage"
+
+    IssueImage:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        cdn_url:
+          type: string
+          format: uri
+        image_type:
+          type: string
+          enum: [REPORT, RESOLUTION_PROOF]
+        created_at:
+          type: string
+          format: date-time
+
+    PaginatedIssueResponse:
+      type: object
+      required: [items, total, page, page_size, total_pages]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/IssueDetail"
+        total:
+          type: integer
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total_pages:
+          type: integer
+
+    # ── Users ─────────────────────────────────────────────────────────
+    UserProfile:
+      type: object
+      # email, name and title are nullable for anonymous or phone-only accounts
+      # and are therefore not required.
+      required: [id, role, trust_score, total_points, is_anonymous, preferred_lang, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        name:
+          type: string
+        role:
+          $ref: "#/components/schemas/UserRole"
+        trust_score:
+          type: number
+        total_points:
+          type: integer
+        title:
+          type: string
+        is_anonymous:
+          type: boolean
+        preferred_lang:
+          type: string
+          # Same six languages the updateMyProfile body accepts. A client may
+          # only ever send one of these, so it must only ever receive one.
+          enum: [en, hi, ta, te, mr, bn]
+        created_at:
+          type: string
+          format: date-time
+
+    LeaderboardResponse:
+      type: object
+      properties:
+        month:
+          type: string
+          example: "2026-07"
+        entries:
+          type: array
+          items:
+            type: object
+            properties:
+              rank:
+                type: integer
+              user_id:
+                type: string
+                format: uuid
+              name:
+                type: string
+              total_points:
+                type: integer
+              title:
+                type: string
+
+    # ── Analytics ─────────────────────────────────────────────────────
+    AnalyticsSummary:
+      type: object
+      properties:
+        total_reported:
+          type: integer
+        total_in_progress:
+          type: integer
+        total_resolved:
+          type: integer
+        total_rejected:
+          type: integer
+        sla_breach_count:
+          type: integer
+        avg_resolution_hours:
+          type: number
+
+    # ── Admin ─────────────────────────────────────────────────────────
+    CreateAuthorityRequest:
+      type: object
+      required: [email, name, employee_id, department_id]
+      properties:
+        email:
+          type: string
+          format: email
+        name:
+          type: string
+        password:
+          type: string
+          minLength: 8
+        employee_id:
+          type: string
+        department_id:
+          type: string
+          format: uuid
+        designation:
+          type: string
+        zone_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+
+    # ── Common ────────────────────────────────────────────────────────
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          # `details` carries a default of {} and so is not required.
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            details:
+              type: object
+
+    HealthResponse:
+      type: object
+      # `status` carries a default ("ok") and so is not required.
+      required: [version, env]
+      properties:
+        status:
+          type: string
+        version:
+          type: string
+        env:
+          type: string

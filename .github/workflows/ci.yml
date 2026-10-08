@@ -1,0 +1,299 @@
+name: Weft Backend CI
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    name: Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+
+      # Printed so a local-vs-CI formatting disagreement is diagnosable from the
+      # log. requirements-dev.txt pins ruff 0.11.13 / black 25.1.0, which must
+      # stay equal to the revs in .pre-commit-config.yaml.
+      - name: Report tool versions
+        run: |
+          ruff --version
+          black --version
+          mypy --version
+
+      - name: Run ruff check
+        run: ruff check .
+
+      - name: Run black check
+        run: black --check .
+
+      # mypy is pinned in requirements-dev.txt and configured strictly in
+      # pyproject.toml (disallow_untyped_defs, warn_return_any, pydantic plugin)
+      # but has never actually run in CI. Advisory for now so the existing
+      # backlog does not block Phase 1; promote to a hard gate by deleting
+      # `continue-on-error` once `mypy app` is clean.
+      - name: Run mypy (advisory — not yet a gate)
+        continue-on-error: true
+        run: mypy app
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: lint
+
+    services:
+      postgres:
+        image: postgis/postgis:15-3.4
+        env:
+          POSTGRES_USER: weft
+          POSTGRES_PASSWORD: weft_dev
+          POSTGRES_DB: weft_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U weft -d weft_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://weft:weft_dev@localhost:5432/weft_test
+      TEST_DATABASE_URL: postgresql+asyncpg://weft:weft_dev@localhost:5432/weft_test
+      REDIS_URL: redis://localhost:6379/0
+      ENV: test
+      DEBUG: "false"
+      JWT_PRIVATE_KEY: ""
+      JWT_PUBLIC_KEY: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+
+      # ── Import smoke check ────────────────────────────────────────────────
+      # app/main.py never imports app.models, and app/core/permissions.py
+      # imports app.models.user lazily inside get_current_user. A broken model
+      # import therefore used to be invisible: the app booted, every test
+      # passed, CI was green, and the first authenticated request 500'd.
+      #
+      # This walks app/models on disk rather than trusting app/models/__init__.py
+      # so a new model module that was never added to __init__ (and is therefore
+      # invisible to `from app.models import *` in migrations/env.py) also fails
+      # here. Needs no database, so it runs before the DB steps and fails fast.
+      - name: Import smoke check (app.main + every model module)
+        run: |
+          python - <<'PY'
+          import importlib
+          import pkgutil
+          import sys
+
+          import app.main  # noqa: F401  — boots routers, schemas, config
+          import app.models
+          from sqlalchemy.orm import configure_mappers
+
+          from app.database import Base
+
+          modules = sorted(
+              m.name for m in pkgutil.walk_packages(app.models.__path__, app.models.__name__ + ".")
+          )
+          if not modules:
+              sys.exit("FAIL: app.models contains no model modules")
+
+          for name in modules:
+              importlib.import_module(name)  # ModuleNotFoundError here fails the build
+
+          # Resolves every relationship() target by class name; catches a model
+          # that exists on disk but is missing from the declarative registry.
+          configure_mappers()
+
+          print("app.main imported OK")
+          print(f"imported {len(modules)} model module(s): {', '.join(modules)}")
+          print(f"registered tables: {', '.join(sorted(Base.metadata.tables))}")
+          PY
+
+      - name: Enable PostGIS extension
+        run: |
+          PGPASSWORD=weft_dev psql -h localhost -U weft -d weft_test -c "CREATE EXTENSION IF NOT EXISTS postgis;"
+
+      # ── Migrations ────────────────────────────────────────────────────────
+      # Nothing used to execute Alembic in CI, so a broken revision chain
+      # (duplicate/missing down_revision, bad SQL, multiple heads) shipped
+      # undetected. `upgrade head` also re-checks the model imports, because
+      # migrations/env.py does `from app.models import *`.
+      - name: Run Alembic migrations (upgrade head)
+        run: |
+          alembic upgrade head
+          alembic current --verbose
+          # More than one head means the revision chain has forked.
+          heads=$(alembic heads | grep -c . || true)
+          if [ "$heads" -ne 1 ]; then
+            echo "FAIL: expected exactly 1 Alembic head, found $heads"
+            alembic heads
+            exit 1
+          fi
+
+      # A one-way upgrade is not a round trip: an unrunnable downgrade only
+      # surfaces during an incident rollback. Exercised on a throwaway CI
+      # database, then returned to head for the steps below.
+      - name: Verify migration downgrade round-trip
+        run: |
+          alembic downgrade base
+          alembic upgrade head
+          alembic current --verbose
+
+      # ── Enum / model / migration consistency ──────────────────────────────
+      # Models declare Postgres enums by name and rely on migration 002 having
+      # created them. Nothing proved the two agreed; a label added to a model
+      # but not to the migration (or vice versa) failed only at runtime.
+      - name: Verify model enums match migration-created enum types
+        run: |
+          PGPASSWORD=weft_dev psql -h localhost -U weft -d weft_test -At -F'|' \
+            -c "SELECT t.typname, e.enumlabel
+                  FROM pg_type t
+                  JOIN pg_enum e ON e.enumtypid = t.oid
+                  JOIN pg_namespace n ON n.oid = t.typnamespace
+                 WHERE n.nspname = 'public'
+                 ORDER BY t.typname, e.enumsortorder;" > /tmp/db_enums.txt
+          python - <<'PY'
+          import importlib
+          import pathlib
+          import pkgutil
+          import sys
+
+          import app.models
+          from sqlalchemy import Enum as SAEnum
+
+          from app.database import Base
+
+          for m in pkgutil.walk_packages(app.models.__path__, app.models.__name__ + "."):
+              importlib.import_module(m.name)
+
+          declared: dict[str, set[str]] = {}
+          for table in Base.metadata.tables.values():
+              for col in table.columns:
+                  col_type = col.type
+                  if isinstance(col_type, SAEnum) and col_type.name:
+                      declared.setdefault(col_type.name, set()).update(col_type.enums or ())
+
+          in_db: dict[str, set[str]] = {}
+          for line in pathlib.Path("/tmp/db_enums.txt").read_text().splitlines():
+              if not line.strip():
+                  continue
+              type_name, label = line.split("|", 1)
+              in_db.setdefault(type_name, set()).add(label)
+
+          failures: list[str] = []
+          for name, labels in sorted(declared.items()):
+              if name not in in_db:
+                  failures.append(f"enum '{name}' is declared by a model but no migration creates it")
+                  continue
+              missing = sorted(labels - in_db[name])
+              if missing:
+                  failures.append(f"enum '{name}': model has label(s) {missing} the DB type does not")
+              extra = sorted(in_db[name] - labels)
+              if extra:
+                  failures.append(f"enum '{name}': DB type has label(s) {extra} no model accepts")
+
+          for name in sorted(set(in_db) - set(declared)):
+              print(f"note: DB enum '{name}' has no model column yet (allowed during build-out)")
+
+          if failures:
+              print("FAIL: enum/model/migration mismatch")
+              for line in failures:
+                  print(f"  - {line}")
+              sys.exit(1)
+
+          print(f"OK: {len(declared)} model-declared enum(s) match the migration-created types")
+          PY
+
+      # ── Tests ─────────────────────────────────────────────────────────────
+      # Single run: the 80% threshold is unchanged, it is just applied to the
+      # same run that produces the report instead of re-running the suite.
+      # NOTE: this gate is currently satisfied largely by import-time execution
+      # of declarative model/schema class bodies. See the report — permissions,
+      # rate_limiter, captcha and dependencies are at 0%.
+      - name: Run tests with coverage (80% gate)
+        run: |
+          pytest --cov=app --cov-report=term-missing --cov-report=xml --cov-fail-under=80 -v
+
+  build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t weft-api:${{ github.sha }} .
+
+      # The shipped image installs requirements.txt only (no dev deps), so this
+      # is the one place the production dependency set is proven to import both
+      # the app and the full model registry. Script is piped over stdin so no
+      # file needs to be baked into the image.
+      - name: Verify Docker image (app.main + every model module)
+        run: |
+          docker run --rm -i weft-api:${{ github.sha }} python - <<'PY'
+          import importlib
+          import pkgutil
+          import sys
+
+          import app.main  # noqa: F401
+          import app.models
+          from sqlalchemy.orm import configure_mappers
+
+          from app.database import Base
+
+          modules = sorted(
+              m.name for m in pkgutil.walk_packages(app.models.__path__, app.models.__name__ + ".")
+          )
+          if not modules:
+              sys.exit("FAIL: app.models contains no model modules in the image")
+
+          for name in modules:
+              importlib.import_module(name)
+
+          configure_mappers()
+
+          print("App loaded successfully")
+          print(f"imported {len(modules)} model module(s): {', '.join(modules)}")
+          print(f"registered tables: {', '.join(sorted(Base.metadata.tables))}")
+          PY

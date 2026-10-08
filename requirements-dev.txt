@@ -1,0 +1,23 @@
+-r requirements.txt
+
+# Pinned 2026-09-08 to the locally installed, verified-green toolchain.
+# See the header of requirements.txt.
+
+# === Testing ===
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-cov==7.1.0
+httpx==0.27.0
+
+# === Linting & Formatting ===
+# ruff and black MUST stay equal to the revs in .pre-commit-config.yaml.
+# D-5: when they drift, local and CI reformat each other's work indefinitely
+# and every PR carries spurious noise. Bump all places together or none.
+ruff==0.15.22
+black==25.1.0
+
+# === Pre-commit ===
+pre-commit==4.2.0  # UNVERIFIED — not installed locally
+
+# === Type Checking ===
+mypy==1.16.0  # UNVERIFIED — not installed locally

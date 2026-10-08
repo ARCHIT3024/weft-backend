@@ -1,0 +1,87 @@
+# ═══════════════════════════════════════════════════════════════════════
+# Weft Backend — Docker Compose (Local Development)
+# PostgreSQL 15 + PostGIS 3.4 + Redis 7 + FastAPI
+#
+# Usage:
+#   docker-compose up -d          # Start all services
+#   docker-compose logs -f api    # Follow API logs
+#   docker-compose down -v        # Stop and remove volumes
+#
+# Host ports are overridable so this stack coexists with any other Postgres or
+# Redis already running on the machine. Container-internal ports never change,
+# so the api service always reaches db:5432 / redis:6379 regardless.
+#   DB_PORT=5433 REDIS_PORT=6380 docker-compose up -d
+# or set them once in a .env file beside this one.
+# ═══════════════════════════════════════════════════════════════════════
+
+services:
+  # ── PostgreSQL 15 + PostGIS 3.4 ──────────────────────────────────────
+  db:
+    image: postgis/postgis:15-3.4
+    container_name: weft-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: weft
+      POSTGRES_PASSWORD: weft_dev
+      POSTGRES_DB: weft_dev
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - weft_pgdata:/var/lib/postgresql/data
+      - ./scripts/init-test-db.sql:/docker-entrypoint-initdb.d/02-init-test-db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U weft -d weft_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Redis 7 ──────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: weft-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - weft_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── FastAPI Application ──────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: weft-api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      - ENV=development
+      - DEBUG=true
+      - DATABASE_URL=postgresql+asyncpg://weft:weft_dev@db:5432/weft_dev
+      - TEST_DATABASE_URL=postgresql+asyncpg://weft:weft_dev@db:5432/weft_test
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./app:/code/app
+      - ./tests:/code/tests
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      uvicorn app.main:app
+        --host 0.0.0.0
+        --port 8000
+        --reload
+        --log-level info
+
+volumes:
+  weft_pgdata:
+    driver: local
+  weft_redis:
+    driver: local

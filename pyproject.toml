@@ -1,0 +1,76 @@
+# ═══════════════════════════════════════════════════════════════════════
+# Weft Backend — Project Configuration
+# ruff, black, pytest, mypy settings
+# ═══════════════════════════════════════════════════════════════════════
+
+[project]
+name = "weft-backend"
+version = "1.0.0"
+description = "Weft — Crowdsourced Civic Issue Reporting Platform API"
+requires-python = ">=3.12"
+
+# ── Ruff (Linter) ──────────────────────────────────────────────────────
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "ANN",    # flake8-annotations
+    "S",      # flake8-bandit (security)
+    "SIM",    # flake8-simplify
+    "N",      # pep8-naming
+    "RUF",    # ruff-specific rules
+]
+ignore = [
+    "ANN401",  # Dynamically typed expressions (typing.Any) are disallowed
+    "S101",    # Use of assert (needed in tests)
+    "S105",    # Possible hardcoded password (false positives in tests)
+    "S106",    # Possible hardcoded password (false positives in tests)
+    "B008",    # Do not perform function calls in argument defaults (FastAPI Depends)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "ANN", "S105", "S106"]
+"app/migrations/**/*.py" = ["ANN", "E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+# ── Black (Formatter) ──────────────────────────────────────────────────
+
+[tool.black]
+target-version = ["py312"]
+line-length = 120
+
+# ── Pytest ─────────────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+addopts = "-v --strict-markers --tb=short"
+
+# ── MyPy ──────────────────────────────────────────────────────────────
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
