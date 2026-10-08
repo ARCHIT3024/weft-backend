@@ -47,8 +47,18 @@ class Settings(BaseSettings):
     CLOUDFRONT_DOMAIN: str = ""
 
     # ── Firebase / FCM ──────────────────────────────────────────────────
+    # Push is real only when a service account is configured. With
+    # FCM_SERVICE_ACCOUNT_JSON empty, `app/core/push.py` selects a logging
+    # sender that delivers nothing and fails nothing, so development never
+    # needs Firebase credentials. The value is either the service-account JSON
+    # itself (it starts with "{" — quote it in .env, see D-4) or a path to the
+    # JSON file. FCM_PROJECT_ID falls back to the JSON's own `project_id`.
     FCM_SERVICE_ACCOUNT_JSON: str = ""
     FCM_PROJECT_ID: str = ""
+    # Attempts per device token, including the first. Only transient failures
+    # (5xx, 429, network) are retried; backoff doubles from the base delay.
+    FCM_MAX_ATTEMPTS: int = 3
+    FCM_RETRY_BASE_DELAY_SECONDS: float = 1.0
 
     # ── Media storage ───────────────────────────────────────────────────
     # Local-disk object storage stands in for S3 until AWS credentials exist.

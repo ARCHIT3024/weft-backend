@@ -1,15 +1,26 @@
-"""Users router — `GET /users/me` is real; the rest are Phase 0 mock stubs."""
+"""Users router — the caller's own profile, devices and reports.
+
+`GET /users/me`, `PATCH /users/me` and `GET /users/me/reports` are real.
+`GET /users/leaderboard` is still a Phase 0 mock: gamification is task 4.3.
+
+Every `/me` route acts on the authenticated caller and takes no user id, so
+there is no parameter through which one account could read or edit another.
+"""
 
 from __future__ import annotations
 
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
 from app.core.permissions import get_current_user
+from app.dependencies import DBSession
 from app.models.user import User
-from app.schemas.user import UserProfile
+from app.schemas.common import PaginatedResponse
+from app.schemas.issue import IssueStatus, IssueSummary
+from app.schemas.user import UpdateProfileRequest, UserProfile
+from app.services import issue_service, user_service
 
 logger = logging.getLogger(__name__)
 
@@ -31,28 +42,58 @@ async def get_my_profile(current_user: CurrentUser) -> UserProfile:
     return UserProfile.model_validate(current_user)
 
 
-@router.patch("/me")
-async def update_profile_mock() -> dict:
-    """Mock: Update profile (name, lang, FCM token)."""
-    return {
-        "id": "550e8400-e29b-41d4-a716-446655440001",
-        "email": "citizen@example.com",
-        "name": "Updated Name",
-        "role": "CITIZEN",
-        "preferred_lang": "hi",
-    }
+@router.patch("/me", response_model=UserProfile, summary="Update own profile / register push device")
+async def update_my_profile(db: DBSession, current_user: CurrentUser, payload: UpdateProfileRequest) -> UserProfile:
+    """Partial update of the caller's profile; returns the updated profile.
+
+    `fcm_token` registers this device for push. The mobile app sends it on every
+    launch (task 2.31), which also keeps `last_seen` fresh. A token another
+    account held moves to the caller — a phone has one current user.
+
+    The token is write-only: no response ever echoes it back.
+    """
+    user = await user_service.update_profile(
+        db,
+        user=current_user,
+        name=payload.name,
+        preferred_lang=payload.preferred_lang.value if payload.preferred_lang else None,
+        fcm_token=payload.fcm_token,
+    )
+    return UserProfile.model_validate(user)
 
 
-@router.get("/me/reports")
-async def get_my_reports_mock() -> dict:
-    """Mock: Get own submitted issues."""
-    return {
-        "items": [],
-        "total": 0,
-        "page": 1,
-        "page_size": 20,
-        "total_pages": 1,
-    }
+@router.get("/me/reports", response_model=PaginatedResponse[IssueSummary], summary="List own submitted issues")
+async def get_my_reports(
+    db: DBSession,
+    current_user: CurrentUser,
+    issue_status: Annotated[list[IssueStatus] | None, Query(alias="status")] = None,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> PaginatedResponse[IssueSummary]:
+    """The caller's own submitted issues, newest first.
+
+    Same query and same item shape as `GET /issues`, narrowed by reporter. The
+    reporter filter is the caller's id, never a parameter. Anonymous reports
+    have no reporter and so appear in nobody's list — including the list of
+    whoever filed them, which is what anonymous means.
+    """
+    rows, total = await issue_service.list_issues(
+        db,
+        filters=issue_service.IssueFilters(
+            reporter_id=current_user.id,
+            statuses=[s.value for s in issue_status] if issue_status else None,
+        ),
+        page=page,
+        page_size=page_size,
+        sort_field="created_at",
+        descending=True,
+    )
+    return PaginatedResponse.create(
+        items=[IssueSummary.model_validate(r) for r in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.get("/leaderboard")

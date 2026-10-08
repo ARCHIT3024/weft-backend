@@ -22,9 +22,11 @@ from app.models.authority_user import AuthorityUser
 from app.models.authority_zone import AuthorityZone
 from app.models.department import Department
 from app.models.department_category import DepartmentCategory
+from app.models.fcm_token import FcmToken
 from app.models.issue import Issue
 from app.models.issue_image import IssueImage
 from app.models.issue_status_history import IssueStatusHistory
+from app.models.notification import Notification
 from app.models.refresh_token import RefreshToken
 from app.models.upvote import Upvote
 from app.models.user import User
@@ -35,9 +37,11 @@ __all__ = [
     "AuthorityZone",
     "Department",
     "DepartmentCategory",
+    "FcmToken",
     "Issue",
     "IssueImage",
     "IssueStatusHistory",
+    "Notification",
     "RefreshToken",
     "Upvote",
     "User",

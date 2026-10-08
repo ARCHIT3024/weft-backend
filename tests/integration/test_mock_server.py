@@ -82,71 +82,34 @@ class TestAuthMock:
 #
 # They are replaced by `tests/integration/test_issues.py`, which exercises the
 # real lifecycle against a live database. `GET /issues` is covered there too.
+
+
+# ── Notifications and /users/me are no longer mocks ─────────────────────
 #
-# The classes below still pin genuine mocks — notifications, analytics and
-# admin are unimplemented, and these tests are what keeps their contract
-# surface from drifting before the real handlers arrive.
+# `TestNotificationsMock` used to live here. It was removed when the real
+# handlers landed (tasks 1.25, 1.26): every notification route now requires an
+# access token and reads the caller's own rows from Postgres, so an
+# unauthenticated call is a 401 and the fixed notification it asserted no
+# longer exists. Replaced by `tests/integration/test_notifications.py`.
+# `PATCH /users/me` and `GET /users/me/reports` likewise left their stubs
+# behind (tasks 1.10, 2.28) and are covered by
+# `tests/integration/test_users_me.py`. `GET /users/leaderboard` is still a
+# stub (task 4.3) and has never been pinned here.
 
 
-class TestNotificationsMock:
-    async def test_list_notifications(self, client: AsyncClient) -> None:
-        response = await client.get("/v1/notifications")
-        assert response.status_code == 200
-        data = response.json()
-        assert "items" in data
-
-    async def test_mark_read(self, client: AsyncClient) -> None:
-        response = await client.patch("/v1/notifications/some-id/read")
-        assert response.status_code == 200
-
-    async def test_mark_all_read(self, client: AsyncClient) -> None:
-        response = await client.patch("/v1/notifications/read-all")
-        assert response.status_code == 200
+# ── Analytics is no longer a mock ────────────────────────────────────────
+#
+# `TestAnalyticsMock` used to live here, asserting the fixed numbers of the
+# Phase 0 stubs. It was removed when the real handlers landed (task 1.29, plus
+# SLA breaches and CSV export): every analytics route now requires an AUTHORITY
+# or ADMIN token and aggregates live over Postgres, so an unauthenticated call
+# is a 401. Replaced by `tests/integration/test_analytics.py`.
 
 
-# ── Analytics Mock Routes ────────────────────────────────────────────────
-
-
-class TestAnalyticsMock:
-    async def test_summary(self, client: AsyncClient) -> None:
-        response = await client.get("/v1/analytics/summary")
-        assert response.status_code == 200
-        data = response.json()
-        assert "total_reported" in data
-        assert "total_resolved" in data
-
-    async def test_heatmap(self, client: AsyncClient) -> None:
-        response = await client.get("/v1/analytics/heatmap")
-        assert response.status_code == 200
-        assert "points" in response.json()
-
-    async def test_resolution_times(self, client: AsyncClient) -> None:
-        response = await client.get("/v1/analytics/resolution-times")
-        assert response.status_code == 200
-
-
-# ── Admin Mock Routes ────────────────────────────────────────────────────
-
-
-class TestAdminMock:
-    async def test_create_authority(self, client: AsyncClient) -> None:
-        response = await client.post("/v1/admin/authority-users")
-        assert response.status_code == 201
-        assert response.json()["role"] == "AUTHORITY"
-
-    async def test_deactivate_authority(self, client: AsyncClient) -> None:
-        response = await client.patch("/v1/admin/authority-users/some-uuid/deactivate")
-        assert response.status_code == 200
-        assert response.json()["is_active"] is False
-
-    async def test_list_departments(self, client: AsyncClient) -> None:
-        response = await client.get("/v1/admin/departments")
-        assert response.status_code == 200
-
-    async def test_create_department(self, client: AsyncClient) -> None:
-        response = await client.post("/v1/admin/departments")
-        assert response.status_code == 201
-
-    async def test_create_zone(self, client: AsyncClient) -> None:
-        response = await client.post("/v1/admin/zones")
-        assert response.status_code == 201
+# ── Admin is no longer a mock ────────────────────────────────────────────
+#
+# `TestAdminMock` used to live here. It was removed when the real handlers
+# landed (tasks 1.11, 1.12, 4.15a): every admin route now requires an ADMIN
+# token and writes to Postgres, so an unauthenticated call is a 401 and the
+# fixed dictionaries it asserted no longer exist. Replaced by
+# `tests/integration/test_admin.py`.
