@@ -29,6 +29,13 @@ from app.schemas.common import (
     SortDirection,
     TimestampMixin,
 )
+from app.schemas.notification import (
+    MarkAllNotificationsReadResponse,
+    NotificationChannel,
+    NotificationListResponse,
+    NotificationOut,
+    NotificationType,
+)
 from app.schemas.user import (
     PreferredLanguage,
     UpdateProfileRequest,
@@ -49,6 +56,12 @@ __all__ = [
     "IDMixin",
     "LoginRequest",
     "LogoutRequest",
+    # notification
+    "MarkAllNotificationsReadResponse",
+    "NotificationChannel",
+    "NotificationListResponse",
+    "NotificationOut",
+    "NotificationType",
     "PaginatedResponse",
     "PaginationParams",
     "PreferredLanguage",

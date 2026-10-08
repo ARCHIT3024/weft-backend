@@ -493,6 +493,21 @@ paths:
     patch:
       tags: [Users]
       summary: Update profile (name, lang, FCM token)
+      description: >-
+        Partial update of the caller's own profile. Every field is optional; an
+        omitted field, or one sent as null, is left unchanged. Unknown fields
+        are a 422 rather than silently ignored — in particular the push token
+        field is `fcm_token`, and a client sending `device_token` would
+        otherwise get a 200 and never receive a push.
+
+        `fcm_token` registers this device for push notifications. The mobile
+        app sends it on every launch. A token belongs to one account at a
+        time: if another account had registered the same token, it moves to
+        the caller. An account keeps at most 10 devices; registering more
+        evicts the least recently seen. The token is write-only and never
+        appears in any response.
+
+        `email` and `phone` are not editable here.
       operationId: updateMyProfile
       security:
         - BearerAuth: []
@@ -502,33 +517,64 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               properties:
                 name:
                   type: string
+                  minLength: 1
                   maxLength: 100
+                  description: Surrounding whitespace is stripped; a blank name is rejected.
                 preferred_lang:
                   type: string
                   enum: [en, hi, ta, te, mr, bn]
                 fcm_token:
                   type: string
+                  minLength: 1
+                  maxLength: 4096
+                  description: Firebase Cloud Messaging registration token for this device.
       responses:
         "200":
-          description: Profile updated
+          description: Profile updated; the full updated profile is returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserProfile"
+        "401":
+          description: Missing or invalid access token
+        "422":
+          description: Invalid value, or an unknown field
 
   /users/me/reports:
     get:
       tags: [Users]
       summary: Get own submitted issues
+      description: >-
+        The caller's own submitted issues, newest first. Same item shape and
+        status filter as `GET /issues`. Anonymous reports have no reporter and
+        appear in nobody's list.
       operationId: getMyReports
       security:
         - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          description: Repeat the key to match several statuses (`?status=REPORTED&status=IN_PROGRESS`).
+          schema: { type: array, items: { $ref: "#/components/schemas/IssueStatus" } }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1, minimum: 1 }
+        - name: page_size
+          in: query
+          schema: { type: integer, default: 20, minimum: 1, maximum: 100 }
       responses:
         "200":
-          description: Paginated list of user's issues
+          description: Paginated list of the caller's issues
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PaginatedIssueResponse"
+                $ref: "#/components/schemas/PaginatedIssueSummaryResponse"
+        "401":
+          description: Missing or invalid access token
 
   /users/leaderboard:
     get:
@@ -548,17 +594,40 @@ paths:
     get:
       tags: [Notifications]
       summary: Get notification list for current user
+      description: >-
+        The caller's own notifications, newest first. `unread_count` counts
+        every unread notification of the caller regardless of page or
+        `unread_only`, so it can drive the bell badge from any page.
       operationId: listNotifications
       security:
         - BearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, default: 1, minimum: 1 }
+        - name: page_size
+          in: query
+          schema: { type: integer, default: 20, minimum: 1, maximum: 100 }
+        - name: unread_only
+          in: query
+          schema: { type: boolean, default: false }
       responses:
         "200":
           description: Notification list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationListResponse"
+        "401":
+          description: Missing or invalid access token
 
   /notifications/{notification_id}/read:
     patch:
       tags: [Notifications]
       summary: Mark notification as read
+      description: >-
+        Idempotent. A notification belonging to another user is a 404, exactly
+        as for an id that does not exist, so ids cannot be probed.
       operationId: markNotificationRead
       security:
         - BearerAuth: []
@@ -569,27 +638,70 @@ paths:
           schema: { type: string, format: uuid }
       responses:
         "200":
-          description: Marked as read
+          description: Marked as read; the updated notification is returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Notification"
+        "401":
+          description: Missing or invalid access token
+        "404":
+          description: No such notification for the caller
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /notifications/read-all:
     patch:
       tags: [Notifications]
       summary: Mark all notifications as read
+      description: Idempotent; a second call reports `updated_count` 0.
       operationId: markAllNotificationsRead
       security:
         - BearerAuth: []
       responses:
         "200":
           description: All marked as read
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MarkAllNotificationsReadResponse"
+        "401":
+          description: Missing or invalid access token
 
   # ── Analytics ───────────────────────────────────────────────────────
+  # Every analytics operation requires an AUTHORITY or ADMIN access token: none
+  # is a 401, a CITIZEN a 403. Figures are computed live from `issues` and
+  # `issue_status_history` (no snapshot table yet).
+  #
+  # Scope: an ADMIN sees every issue. An AUTHORITY sees only issues whose
+  # zone_id is one of their assigned zones (authority_zones); their department
+  # is not a scope boundary. An AUTHORITY with no authority profile gets 403
+  # AUTHORITY_PROFILE_MISSING; filtering by a zone outside their scope gets 403
+  # ZONE_OUT_OF_SCOPE. An authority with no zones gets all-zero figures.
+  #
+  # The shared filters select issues by report time (`created_at`), inclusive
+  # at both ends; a timezone-less date-time is read as UTC. from_date after
+  # to_date is a 400 INVALID_DATE_RANGE.
+  #
+  # Resolution time = hours from report to the latest RESOLVED history row, for
+  # issues currently RESOLVED only — a reopened-then-re-resolved issue counts to
+  # its final resolution. SLA breach = not RESOLVED/REJECTED and older than the
+  # department's sla_hours; issues with no department never breach.
   /analytics/summary:
     get:
       tags: [Analytics]
-      summary: KPI summary (authority only)
+      summary: KPI summary
       operationId: analyticsSummary
       security:
         - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/AnalyticsFromDate"
+        - $ref: "#/components/parameters/AnalyticsToDate"
+        - $ref: "#/components/parameters/AnalyticsDepartmentId"
+        - $ref: "#/components/parameters/AnalyticsZoneId"
+        - $ref: "#/components/parameters/AnalyticsCategory"
       responses:
         "200":
           description: KPI data
@@ -597,44 +709,136 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AnalyticsSummary"
+        "400":
+          $ref: "#/components/responses/AnalyticsBadRequest"
+        "401":
+          description: Missing or invalid access token
+        "403":
+          $ref: "#/components/responses/AnalyticsForbidden"
 
   /analytics/heatmap:
     get:
       tags: [Analytics]
-      summary: Geo-aggregated issue density for map
+      summary: Grid-aggregated issue density for the map
+      description: >-
+        Each issue snaps to the nearest node of a square lat/lng grid (the
+        rounding ST_SnapToGrid performs); one point per occupied cell, densest
+        first. At most 2000 points; `truncated` is true when more cells existed.
+        Defaults to open issues (REPORTED, IN_PROGRESS).
       operationId: analyticsHeatmap
       security:
         - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/AnalyticsFromDate"
+        - $ref: "#/components/parameters/AnalyticsToDate"
+        - $ref: "#/components/parameters/AnalyticsDepartmentId"
+        - $ref: "#/components/parameters/AnalyticsZoneId"
+        - $ref: "#/components/parameters/AnalyticsCategory"
+        - name: status
+          in: query
+          description: Statuses to include; repeat the key for several. Defaults to REPORTED and IN_PROGRESS.
+          schema: { type: array, items: { $ref: "#/components/schemas/IssueStatus" } }
+        - name: grid
+          in: query
+          description: Grid cell edge in degrees (0.01 ≈ 1.1 km).
+          schema: { type: number, format: double, default: 0.01, minimum: 0.001, maximum: 1.0 }
       responses:
         "200":
           description: Heatmap grid points
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HeatmapResponse"
+        "400":
+          $ref: "#/components/responses/AnalyticsBadRequest"
+        "401":
+          description: Missing or invalid access token
+        "403":
+          $ref: "#/components/responses/AnalyticsForbidden"
 
   /analytics/resolution-times:
     get:
       tags: [Analytics]
-      summary: Avg resolution time per category/dept
+      summary: Resolution times per category/department/zone, with a trend
+      description: >-
+        Trend buckets are the UTC day/week/month (weeks start Monday) in which
+        each issue's standing resolution was recorded; empty buckets are
+        omitted. At most 400 buckets, newest kept; `trend_truncated` says when
+        older ones were dropped.
       operationId: analyticsResolutionTimes
       security:
         - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/AnalyticsFromDate"
+        - $ref: "#/components/parameters/AnalyticsToDate"
+        - $ref: "#/components/parameters/AnalyticsDepartmentId"
+        - $ref: "#/components/parameters/AnalyticsZoneId"
+        - $ref: "#/components/parameters/AnalyticsCategory"
+        - name: group_by
+          in: query
+          schema: { type: string, enum: [category, department, zone], default: category }
+        - name: interval
+          in: query
+          schema: { type: string, enum: [day, week, month], default: week }
       responses:
         "200":
           description: Resolution time data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResolutionTimesResponse"
+        "400":
+          $ref: "#/components/responses/AnalyticsBadRequest"
+        "401":
+          description: Missing or invalid access token
+        "403":
+          $ref: "#/components/responses/AnalyticsForbidden"
 
   /analytics/sla-breaches:
     get:
       tags: [Analytics]
-      summary: Issues exceeding SLA threshold
+      summary: Open issues past their department's SLA, most overdue first
       operationId: analyticsSlaBreaches
       security:
         - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/AnalyticsFromDate"
+        - $ref: "#/components/parameters/AnalyticsToDate"
+        - $ref: "#/components/parameters/AnalyticsDepartmentId"
+        - $ref: "#/components/parameters/AnalyticsZoneId"
+        - $ref: "#/components/parameters/AnalyticsCategory"
+        - name: page
+          in: query
+          schema: { type: integer, default: 1, minimum: 1 }
+        - name: page_size
+          in: query
+          schema: { type: integer, default: 20, minimum: 1, maximum: 100 }
       responses:
         "200":
           description: SLA breach list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedSlaBreachResponse"
+        "400":
+          $ref: "#/components/responses/AnalyticsBadRequest"
+        "401":
+          description: Missing or invalid access token
+        "403":
+          $ref: "#/components/responses/AnalyticsForbidden"
 
   /analytics/export:
     get:
       tags: [Analytics]
-      summary: CSV or PDF export
+      summary: Export issues as CSV
+      description: >-
+        One row per in-scope issue, every field except the reporter (anonymity
+        is a product promise). UTF-8 with a byte-order mark, CRLF line endings,
+        RFC 4180 quoting. Text cells beginning with = + - @ tab or CR (also
+        after leading whitespace) are prefixed with an apostrophe so spreadsheet
+        software cannot execute them. At most 50000 rows; more is a 400
+        EXPORT_TOO_LARGE, never a truncated file. `format=pdf` is not
+        implemented yet (task 4.18) and returns 501 EXPORT_FORMAT_NOT_SUPPORTED.
       operationId: analyticsExport
       security:
         - BearerAuth: []
@@ -642,15 +846,87 @@ paths:
         - name: format
           in: query
           schema: { type: string, enum: [csv, pdf], default: csv }
+        - $ref: "#/components/parameters/AnalyticsFromDate"
+        - $ref: "#/components/parameters/AnalyticsToDate"
+        - $ref: "#/components/parameters/AnalyticsDepartmentId"
+        - $ref: "#/components/parameters/AnalyticsZoneId"
+        - $ref: "#/components/parameters/AnalyticsCategory"
       responses:
         "200":
-          description: File download
+          description: >-
+            CSV file download (`Content-Disposition: attachment;
+            filename="weft-issues-<UTC timestamp>.csv"`). Columns, in order:
+            issue_number, issue_id, category, status, description,
+            address_text, latitude, longitude, zone_id, zone_name,
+            department_id, department_name, upvote_count, assigned_to_id,
+            assigned_to_employee_id, assigned_at, created_at, updated_at,
+            resolved_at, resolution_hours, resolution_note, reopen_count,
+            sla_hours, age_hours, sla_breached.
+          content:
+            text/csv:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/AnalyticsBadRequest"
+        "401":
+          description: Missing or invalid access token
+        "403":
+          $ref: "#/components/responses/AnalyticsForbidden"
+        "501":
+          description: format=pdf — not implemented yet (EXPORT_FORMAT_NOT_SUPPORTED)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   # ── Admin ───────────────────────────────────────────────────────────
+  # Every admin operation requires an ADMIN access token: none is a 401, any
+  # other role a 403. Validation failures not listed per operation are 422.
   /admin/authority-users:
+    get:
+      tags: [Admin]
+      summary: List authority accounts
+      description: |
+        Paginated, ordered by name. Each item carries two ids: `id` (the
+        authority profile — what `assignIssue` takes as `assigned_to_id`) and
+        `user_id` (the account — what `deactivateAuthorityUser` takes).
+        No credential material is returned.
+      operationId: listAuthorityUsers
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: department_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: is_active
+          in: query
+          schema: { type: boolean }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1, minimum: 1 }
+        - name: page_size
+          in: query
+          schema: { type: integer, default: 20, minimum: 1, maximum: 100 }
+      responses:
+        "200":
+          description: Paginated authority accounts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedAuthorityUserResponse"
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not an ADMIN
+
     post:
       tags: [Admin]
       summary: Create a new authority account
+      description: |
+        Creates a `users` row with role AUTHORITY, its `authority_users`
+        profile and its zone assignments, atomically. The initial password is
+        supplied by the admin (same policy as citizen registration) and is
+        never returned; there is no email delivery.
       operationId: createAuthorityUser
       security:
         - BearerAuth: []
@@ -663,11 +939,41 @@ paths:
       responses:
         "201":
           description: Authority account created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthorityUser"
+        "400":
+          description: "`DEPARTMENT_INACTIVE`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not an ADMIN
+        "404":
+          description: Department or zone not found (`details.missing_zone_ids` names the zones)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: "`EMAIL_ALREADY_REGISTERED` or `EMPLOYEE_ID_ALREADY_EXISTS`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /admin/authority-users/{user_id}/deactivate:
     patch:
       tags: [Admin]
       summary: Deactivate authority account
+      description: |
+        Sets `is_active = false` (the account is never deleted) and revokes
+        every refresh token the account holds, in one transaction. Idempotent.
+        `user_id` is the account's user id, not its authority profile id.
       operationId: deactivateAuthorityUser
       security:
         - BearerAuth: []
@@ -679,6 +985,26 @@ paths:
       responses:
         "200":
           description: Account deactivated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthorityUser"
+        "400":
+          description: "`CANNOT_DEACTIVATE_SELF`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not an ADMIN
+        "404":
+          description: No authority account has this user id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /admin/departments:
     get:
@@ -689,7 +1015,15 @@ paths:
         - BearerAuth: []
       responses:
         "200":
-          description: Department list
+          description: Every department, active or not, ordered by code
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DepartmentList"
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not an ADMIN
 
     post:
       tags: [Admin]
@@ -697,20 +1031,125 @@ paths:
       operationId: createDepartment
       security:
         - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDepartmentRequest"
       responses:
         "201":
-          description: Department created
+          description: Department created (routes no categories until mapped)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Department"
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not an ADMIN
+        "409":
+          description: "`DEPARTMENT_NAME_EXISTS` (case-insensitive) or `DEPARTMENT_CODE_EXISTS`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /admin/departments/{department_id}:
+    patch:
+      tags: [Admin]
+      summary: Update a department's SLA and upvote alert threshold
+      operationId: updateDepartment
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: department_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateDepartmentRequest"
+      responses:
+        "200":
+          description: Department updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Department"
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not an ADMIN
+        "404":
+          description: Department not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: A value below 1, an explicit null, or an empty body
 
   /admin/zones:
+    get:
+      tags: [Admin]
+      summary: List all zones
+      operationId: listZones
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Every zone, active or not, with its boundary, ordered by name
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ZoneList"
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not an ADMIN
+
     post:
       tags: [Admin]
       summary: Create a new geographic zone
       operationId: createZone
       security:
         - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateZoneRequest"
       responses:
         "201":
           description: Zone created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Zone"
+        "400":
+          description: |
+            `INVALID_GEOMETRY` — unclosed ring, fewer than 4 positions, a
+            coordinate out of range, a non-2D position, or rejected by PostGIS
+            `ST_IsValid` (e.g. self-intersection). `details.reason` says which.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not an ADMIN
+        "404":
+          description: Department not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /admin/system/stats:
     get:
@@ -722,6 +1161,14 @@ paths:
       responses:
         "200":
           description: System stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SystemStats"
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not an ADMIN
 
 # ═══════════════════════════════════════════════════════════════════════
 # Components
@@ -744,6 +1191,50 @@ components:
         type: string
         format: uuid
       description: Issue UUID
+
+    # Shared filters of every /analytics operation.
+    AnalyticsFromDate:
+      name: from_date
+      in: query
+      description: Issues reported at or after this instant (inclusive). No timezone means UTC.
+      schema: { type: string, format: date-time }
+    AnalyticsToDate:
+      name: to_date
+      in: query
+      description: Issues reported at or before this instant (inclusive). No timezone means UTC.
+      schema: { type: string, format: date-time }
+    AnalyticsDepartmentId:
+      name: department_id
+      in: query
+      schema: { type: string, format: uuid }
+    AnalyticsZoneId:
+      name: zone_id
+      in: query
+      description: For an AUTHORITY, must be one of their zones (else 403 ZONE_OUT_OF_SCOPE).
+      schema: { type: string, format: uuid }
+    AnalyticsCategory:
+      name: category
+      in: query
+      description: Repeat the key for several categories.
+      schema: { type: array, items: { $ref: "#/components/schemas/IssueCategory" } }
+
+  responses:
+    AnalyticsBadRequest:
+      description: >-
+        INVALID_DATE_RANGE (from_date after to_date), or on export
+        EXPORT_TOO_LARGE (more than 50000 rows match; narrow the filters)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    AnalyticsForbidden:
+      description: >-
+        FORBIDDEN (not AUTHORITY or ADMIN), AUTHORITY_PROFILE_MISSING (an
+        AUTHORITY account with no authority profile), or ZONE_OUT_OF_SCOPE
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
 
   schemas:
     # ── Enums ─────────────────────────────────────────────────────────
@@ -997,6 +1488,75 @@ components:
         total_pages:
           type: integer
 
+    IssueSummary:
+      type: object
+      # Mirrors app.schemas.issue.IssueSummary. Required = the fields with no
+      # default; the nullable ones are absent-or-null for unrouted, unassigned
+      # or unresolved issues.
+      required: [id, issue_number, category, status, latitude, longitude, upvote_count, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        issue_number:
+          type: string
+          example: "ISS-2026-K7QD3M8XPZ"
+        category:
+          $ref: "#/components/schemas/IssueCategory"
+        description:
+          type: string
+          nullable: true
+        status:
+          $ref: "#/components/schemas/IssueStatus"
+        latitude:
+          type: number
+        longitude:
+          type: number
+        address_text:
+          type: string
+          nullable: true
+        upvote_count:
+          type: integer
+        zone_id:
+          type: string
+          format: uuid
+          nullable: true
+        department_id:
+          type: string
+          format: uuid
+          nullable: true
+        assigned_to_id:
+          type: string
+          format: uuid
+          nullable: true
+        resolved_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    PaginatedIssueSummaryResponse:
+      type: object
+      required: [items, total, page, page_size, total_pages]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/IssueSummary"
+        total:
+          type: integer
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total_pages:
+          type: integer
+
     # ── Users ─────────────────────────────────────────────────────────
     UserProfile:
       type: object
@@ -1053,48 +1613,605 @@ components:
               title:
                 type: string
 
+    # ── Notifications ─────────────────────────────────────────────────
+    NotificationType:
+      type: string
+      # Same values as the notification_type Postgres enum (migration 002).
+      # Only STATUS_CHANGE is emitted today; the rest are reserved.
+      enum: [STATUS_CHANGE, ISSUE_ASSIGNED, UPVOTE_MILESTONE, GAMIFICATION_REWARD, SYSTEM]
+
+    NotificationChannel:
+      type: string
+      # PUSH: the user had a device registered when it was sent. IN_APP: none.
+      enum: [PUSH, IN_APP, EMAIL]
+
+    Notification:
+      type: object
+      # issue_id is nullable (no issue, or the issue was deleted) and so is not
+      # required.
+      required: [id, type, channel, title, body, is_read, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          $ref: "#/components/schemas/NotificationType"
+        channel:
+          $ref: "#/components/schemas/NotificationChannel"
+        title:
+          type: string
+          example: "Update on ISS-2026-K7QD3M8XPZ"
+        body:
+          type: string
+          example: "Your pothole report on MG Road is being addressed."
+        issue_id:
+          type: string
+          format: uuid
+          nullable: true
+        is_read:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+
+    NotificationListResponse:
+      type: object
+      required: [items, total, page, page_size, total_pages, unread_count]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Notification"
+        total:
+          type: integer
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total_pages:
+          type: integer
+        unread_count:
+          type: integer
+          minimum: 0
+          description: Every unread notification of the caller, independent of page and filter.
+
+    MarkAllNotificationsReadResponse:
+      type: object
+      required: [updated_count]
+      properties:
+        updated_count:
+          type: integer
+          minimum: 0
+
     # ── Analytics ─────────────────────────────────────────────────────
+    # `required` lists below are derived from app/schemas/analytics.py
+    # (required = no default) and pinned by tests/unit/test_contract_drift.py.
+    # Nullable fields are required too: always present, null when there is no
+    # figure — never 0, which a chart would draw as one.
     AnalyticsSummary:
       type: object
+      description: total_reported = awaiting_triage + in_progress + resolved + rejected.
+      required:
+        - total_reported
+        - total_awaiting_triage
+        - total_in_progress
+        - total_resolved
+        - total_rejected
+        - total_reopened
+        - sla_breach_count
+        - avg_resolution_hours
+        - median_resolution_hours
+        - category_breakdown
+        - generated_at
       properties:
         total_reported:
           type: integer
+          description: Every issue matching the filters, in any status
+        total_awaiting_triage:
+          type: integer
+          description: Issues still in REPORTED status
         total_in_progress:
           type: integer
         total_resolved:
           type: integer
         total_rejected:
           type: integer
+        total_reopened:
+          type: integer
+          description: Issues resolved and later reopened at least once, whatever their status now
         sla_breach_count:
           type: integer
+          description: Open issues older than their department's sla_hours
         avg_resolution_hours:
           type: number
+          nullable: true
+          description: Mean hours from report to the standing resolution; null when none resolved
+        median_resolution_hours:
+          type: number
+          nullable: true
+        category_breakdown:
+          type: array
+          description: All seven categories, in IssueCategory enum order
+          items:
+            $ref: "#/components/schemas/CategoryCount"
+        generated_at:
+          type: string
+          format: date-time
+
+    CategoryCount:
+      type: object
+      required: [category, count]
+      properties:
+        category:
+          $ref: "#/components/schemas/IssueCategory"
+        count:
+          type: integer
+
+    HeatmapResponse:
+      type: object
+      required: [grid_size_deg, points, truncated]
+      properties:
+        grid_size_deg:
+          type: number
+          description: Edge length of a grid cell, in degrees
+        points:
+          type: array
+          description: Occupied cells, densest first; at most 2000
+          items:
+            $ref: "#/components/schemas/HeatmapPoint"
+        truncated:
+          type: boolean
+          description: True when more cells existed than were returned
+
+    HeatmapPoint:
+      type: object
+      required: [lat, lng, issue_count, total_upvotes]
+      properties:
+        lat:
+          type: number
+          description: Grid node latitude
+        lng:
+          type: number
+          description: Grid node longitude
+        issue_count:
+          type: integer
+        total_upvotes:
+          type: integer
+
+    ResolutionTimeStats:
+      type: object
+      required: [resolved_count, avg_hours, median_hours]
+      properties:
+        resolved_count:
+          type: integer
+        avg_hours:
+          type: number
+          nullable: true
+        median_hours:
+          type: number
+          nullable: true
+
+    ResolutionTimeGroup:
+      type: object
+      required: [resolved_count, avg_hours, median_hours, key, label]
+      properties:
+        resolved_count:
+          type: integer
+        avg_hours:
+          type: number
+          nullable: true
+        median_hours:
+          type: number
+          nullable: true
+        key:
+          type: string
+          nullable: true
+          description: Category value, or department/zone UUID; null for issues with none
+        label:
+          type: string
+          description: Category, or department/zone name; "Unassigned" when key is null
+
+    ResolutionTrendPoint:
+      type: object
+      required: [resolved_count, avg_hours, median_hours, period_start]
+      properties:
+        resolved_count:
+          type: integer
+        avg_hours:
+          type: number
+          nullable: true
+        median_hours:
+          type: number
+          nullable: true
+        period_start:
+          type: string
+          format: date
+          description: First UTC day of the bucket
+
+    ResolutionTimesResponse:
+      type: object
+      required: [group_by, interval, overall, groups, trend, trend_truncated]
+      properties:
+        group_by:
+          type: string
+          enum: [category, department, zone]
+        interval:
+          type: string
+          enum: [day, week, month]
+        overall:
+          $ref: "#/components/schemas/ResolutionTimeStats"
+        groups:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResolutionTimeGroup"
+        trend:
+          type: array
+          description: Oldest first; buckets with no resolution are omitted
+          items:
+            $ref: "#/components/schemas/ResolutionTrendPoint"
+        trend_truncated:
+          type: boolean
+
+    SlaBreach:
+      type: object
+      required:
+        - id
+        - issue_number
+        - category
+        - status
+        - address_text
+        - zone_id
+        - zone_name
+        - department_id
+        - department_name
+        - assigned_to_id
+        - upvote_count
+        - sla_hours
+        - age_hours
+        - hours_overdue
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        issue_number:
+          type: string
+        category:
+          $ref: "#/components/schemas/IssueCategory"
+        status:
+          $ref: "#/components/schemas/IssueStatus"
+        address_text:
+          type: string
+          nullable: true
+        zone_id:
+          type: string
+          format: uuid
+          nullable: true
+        zone_name:
+          type: string
+          nullable: true
+        department_id:
+          type: string
+          format: uuid
+        department_name:
+          type: string
+        assigned_to_id:
+          type: string
+          format: uuid
+          nullable: true
+        upvote_count:
+          type: integer
+        sla_hours:
+          type: integer
+        age_hours:
+          type: number
+          description: Hours since the issue was reported
+        hours_overdue:
+          type: number
+          description: age_hours minus sla_hours
+        created_at:
+          type: string
+          format: date-time
+
+    PaginatedSlaBreachResponse:
+      type: object
+      required: [items, total, page, page_size, total_pages]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/SlaBreach"
+        total:
+          type: integer
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total_pages:
+          type: integer
 
     # ── Admin ─────────────────────────────────────────────────────────
+    # `required` lists below are derived from app/schemas/admin.py (required =
+    # no default) and pinned by tests/unit/test_contract_drift.py.
     CreateAuthorityRequest:
       type: object
-      required: [email, name, employee_id, department_id]
+      # `password` became required when the real handler landed: there is no
+      # email delivery, so the admin supplies the initial password (TRD §8's
+      # SES-delivered temporary password is not built).
+      required: [email, name, password, employee_id, department_id]
       properties:
         email:
           type: string
           format: email
+          maxLength: 255
         name:
           type: string
+          minLength: 1
+          maxLength: 100
         password:
           type: string
           minLength: 8
+          description: Initial password; same policy as citizen registration. Never returned.
         employee_id:
           type: string
+          minLength: 1
+          maxLength: 50
         department_id:
           type: string
           format: uuid
         designation:
           type: string
+          maxLength: 100
+          nullable: true
+        zone_ids:
+          type: array
+          description: Every id must exist; duplicates are ignored
+          items:
+            type: string
+            format: uuid
+
+    AuthorityUser:
+      type: object
+      description: An authority account as an admin sees it. Carries no credential material.
+      # name and designation are nullable and therefore not required.
+      required:
+        [id, user_id, email, role, is_active, employee_id, department_id, department_name, is_dept_admin, zone_ids, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Authority profile id — the value assignIssue takes as assigned_to_id
+        user_id:
+          type: string
+          format: uuid
+          description: User account id — the value deactivateAuthorityUser takes
+        email:
+          type: string
+        name:
+          type: string
+          nullable: true
+        role:
+          $ref: "#/components/schemas/UserRole"
+        is_active:
+          type: boolean
+        employee_id:
+          type: string
+        department_id:
+          type: string
+          format: uuid
+        department_name:
+          type: string
+        designation:
+          type: string
+          nullable: true
+        is_dept_admin:
+          type: boolean
         zone_ids:
           type: array
           items:
             type: string
             format: uuid
+        created_at:
+          type: string
+          format: date-time
+
+    PaginatedAuthorityUserResponse:
+      type: object
+      required: [items, total, page, page_size, total_pages]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuthorityUser"
+        total:
+          type: integer
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total_pages:
+          type: integer
+
+    Department:
+      type: object
+      # description and contact_email are nullable and therefore not required.
+      required: [id, name, code, sla_hours, upvote_alert_threshold, is_active, categories, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        code:
+          type: string
+        description:
+          type: string
+          nullable: true
+        contact_email:
+          type: string
+          nullable: true
+        sla_hours:
+          type: integer
+          minimum: 1
+        upvote_alert_threshold:
+          type: integer
+          minimum: 1
+        is_active:
+          type: boolean
+        categories:
+          type: array
+          description: Issue categories routed to this department
+          items:
+            $ref: "#/components/schemas/IssueCategory"
+        created_at:
+          type: string
+          format: date-time
+
+    DepartmentList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Department"
+
+    CreateDepartmentRequest:
+      type: object
+      # Category routing is deliberately not settable here (see D-10).
+      required: [name, code]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: Unique, compared case-insensitively
+        code:
+          type: string
+          minLength: 1
+          maxLength: 20
+          pattern: "^[A-Z0-9_]+$"
+          description: Unique; uppercased by the server before the pattern is checked
+        description:
+          type: string
+          nullable: true
+        contact_email:
+          type: string
+          format: email
+          nullable: true
+        sla_hours:
+          type: integer
+          minimum: 1
+          maximum: 8760
+          default: 72
+        upvote_alert_threshold:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+          default: 10
+
+    UpdateDepartmentRequest:
+      type: object
+      description: |
+        Partial update; at least one field must be present. Omitted fields are
+        unchanged; an explicit null is a 422.
+      properties:
+        sla_hours:
+          type: integer
+          minimum: 1
+          maximum: 8760
+        upvote_alert_threshold:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+
+    GeoJSONPolygon:
+      type: object
+      description: GeoJSON Polygon (RFC 7946), SRID 4326, positions as [longitude, latitude]
+      required: [type, coordinates]
+      properties:
+        type:
+          type: string
+          enum: [Polygon]
+        coordinates:
+          type: array
+          description: Linear rings — the first is the exterior, the rest are holes. Each closed, 4+ positions.
+          items:
+            type: array
+            items:
+              type: array
+              minItems: 2
+              maxItems: 2
+              items:
+                type: number
+
+    CreateZoneRequest:
+      type: object
+      required: [name, boundary]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        department_id:
+          type: string
+          format: uuid
+          nullable: true
+        boundary:
+          $ref: "#/components/schemas/GeoJSONPolygon"
+
+    Zone:
+      type: object
+      # department_id is nullable and therefore not required.
+      required: [id, name, is_active, boundary, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        department_id:
+          type: string
+          format: uuid
+          nullable: true
+        is_active:
+          type: boolean
+        boundary:
+          $ref: "#/components/schemas/GeoJSONPolygon"
+        created_at:
+          type: string
+          format: date-time
+
+    ZoneList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Zone"
+
+    SystemStats:
+      type: object
+      description: Row counts taken at request time.
+      required: [total_users, total_issues, total_resolved, active_authority_users, departments, zones]
+      properties:
+        total_users:
+          type: integer
+          description: Every account, all roles, active or not
+        total_issues:
+          type: integer
+        total_resolved:
+          type: integer
+          description: Issues currently RESOLVED
+        active_authority_users:
+          type: integer
+        departments:
+          type: integer
+          description: Active departments
+        zones:
+          type: integer
+          description: Active zones
 
     # ── Common ────────────────────────────────────────────────────────
     ErrorResponse:

@@ -18,6 +18,33 @@ from typing import Any
 import pytest
 import yaml
 
+from app.schemas.admin import (
+    AuthorityUserOut,
+    CreateAuthorityRequest,
+    CreateDepartmentRequest,
+    CreateZoneRequest,
+    DepartmentListResponse,
+    DepartmentOut,
+    GeoJSONPolygon,
+    SystemStats,
+    UpdateDepartmentRequest,
+    ZoneListResponse,
+    ZoneOut,
+)
+from app.schemas.analytics import (
+    AnalyticsSummary,
+    CategoryCount,
+    ExportFormat,
+    HeatmapPoint,
+    HeatmapResponse,
+    ResolutionGroupBy,
+    ResolutionTimeGroup,
+    ResolutionTimesResponse,
+    ResolutionTimeStats,
+    ResolutionTrendPoint,
+    SlaBreach,
+    TrendInterval,
+)
 from app.schemas.auth import (
     AppleOAuthRequest,
     AuthResponse,
@@ -31,6 +58,14 @@ from app.schemas.auth import (
     TokenType,
 )
 from app.schemas.common import ErrorDetail, ErrorResponse, HealthResponse, PaginatedResponse
+from app.schemas.issue import IssueStatus, IssueSummary
+from app.schemas.notification import (
+    MarkAllNotificationsReadResponse,
+    NotificationChannel,
+    NotificationListResponse,
+    NotificationOut,
+    NotificationType,
+)
 from app.schemas.user import PreferredLanguage, UpdateProfileRequest, UserProfile, UserRole
 
 # Resolved from this file, not the process CWD, so the suite passes regardless of
@@ -80,6 +115,36 @@ COMPONENT_CASES = [
     (PaginatedResponse, "PaginatedIssueResponse"),
     (ErrorResponse, "ErrorResponse"),
     (HealthResponse, "HealthResponse"),
+    # Admin (tasks 1.11, 1.12, 4.15a)
+    (CreateAuthorityRequest, "CreateAuthorityRequest"),
+    (AuthorityUserOut, "AuthorityUser"),
+    (PaginatedResponse, "PaginatedAuthorityUserResponse"),
+    (DepartmentOut, "Department"),
+    (DepartmentListResponse, "DepartmentList"),
+    (CreateDepartmentRequest, "CreateDepartmentRequest"),
+    (UpdateDepartmentRequest, "UpdateDepartmentRequest"),
+    (GeoJSONPolygon, "GeoJSONPolygon"),
+    (CreateZoneRequest, "CreateZoneRequest"),
+    (ZoneOut, "Zone"),
+    (ZoneListResponse, "ZoneList"),
+    (SystemStats, "SystemStats"),
+    # Users + notifications (tasks 1.10, 1.26, 2.28)
+    (IssueSummary, "IssueSummary"),
+    (PaginatedResponse, "PaginatedIssueSummaryResponse"),
+    (NotificationOut, "Notification"),
+    (NotificationListResponse, "NotificationListResponse"),
+    (MarkAllNotificationsReadResponse, "MarkAllNotificationsReadResponse"),
+    # Analytics (task 1.29, SLA breaches, CSV export)
+    (AnalyticsSummary, "AnalyticsSummary"),
+    (CategoryCount, "CategoryCount"),
+    (HeatmapResponse, "HeatmapResponse"),
+    (HeatmapPoint, "HeatmapPoint"),
+    (ResolutionTimeStats, "ResolutionTimeStats"),
+    (ResolutionTimeGroup, "ResolutionTimeGroup"),
+    (ResolutionTrendPoint, "ResolutionTrendPoint"),
+    (ResolutionTimesResponse, "ResolutionTimesResponse"),
+    (SlaBreach, "SlaBreach"),
+    (PaginatedResponse, "PaginatedSlaBreachResponse"),
 ]
 
 
@@ -332,7 +397,7 @@ def test_auth_me_is_absent_from_the_contract() -> None:
 
 # ── Credential material must never appear in a response ─────────────────
 
-RESPONSE_MODELS = [RegisterResponse, AuthResponse, TokenResponse, UserProfile]
+RESPONSE_MODELS = [RegisterResponse, AuthResponse, TokenResponse, UserProfile, AuthorityUserOut]
 
 
 @pytest.mark.parametrize("model", RESPONSE_MODELS, ids=[m.__name__ for m in RESPONSE_MODELS])
@@ -340,3 +405,188 @@ def test_response_models_expose_no_credential_material(model: type) -> None:
     """Refresh tokens are issued in responses by design; passwords never are."""
     leaked = [name for name in model.model_fields if "password" in name.lower() or name.endswith("_hash")]
     assert not leaked, f"{model.__name__} exposes credential field(s): {leaked}"
+
+
+# ── Users + notifications ───────────────────────────────────────────────
+
+
+def test_notification_type_enum_matches_contract_and_migration_002() -> None:
+    assert [m.value for m in NotificationType] == COMPONENTS["NotificationType"]["enum"]
+
+
+def test_notification_channel_enum_matches_contract() -> None:
+    assert [m.value for m in NotificationChannel] == COMPONENTS["NotificationChannel"]["enum"]
+
+
+def test_my_reports_status_filter_uses_the_issue_status_enum() -> None:
+    params = {p["name"]: p for p in PATHS["/users/me/reports"]["get"]["parameters"]}
+    assert params["status"]["schema"]["items"]["$ref"] == "#/components/schemas/IssueStatus"
+    assert COMPONENTS["IssueStatus"]["enum"] == [m.value for m in IssueStatus]
+
+
+@pytest.mark.parametrize(
+    ("path", "method", "component"),
+    [
+        ("/users/me", "patch", "UserProfile"),
+        ("/users/me/reports", "get", "PaginatedIssueSummaryResponse"),
+        ("/notifications", "get", "NotificationListResponse"),
+        ("/notifications/{notification_id}/read", "patch", "Notification"),
+        ("/notifications/read-all", "patch", "MarkAllNotificationsReadResponse"),
+    ],
+)
+def test_real_user_and_notification_endpoints_document_their_response(path: str, method: str, component: str) -> None:
+    """These were Phase 0 mocks with undocumented bodies; each now names its model."""
+    ok = PATHS[path][method]["responses"]["200"]
+    assert ok["content"]["application/json"]["schema"]["$ref"] == f"#/components/schemas/{component}"
+    assert PATHS[path][method]["security"] == [{"BearerAuth": []}]
+    assert "401" in PATHS[path][method]["responses"]
+
+
+def test_mark_read_documents_404_and_not_403() -> None:
+    """Another user's notification is indistinguishable from a missing one."""
+    responses = PATHS["/notifications/{notification_id}/read"]["patch"]["responses"]
+    assert "404" in responses
+    assert "403" not in responses
+
+
+def test_update_profile_rejects_unknown_fields_on_both_sides() -> None:
+    """The push field is `fcm_token`; a lenient body would swallow a `device_token` typo."""
+    assert _inline_body("/users/me", "patch").get("additionalProperties") is False
+    assert UpdateProfileRequest.model_config.get("extra") == "forbid"
+
+
+def test_update_profile_length_bounds_match_contract() -> None:
+    body = _inline_body("/users/me", "patch")["properties"]
+    for field in ("name", "fcm_token"):
+        constraints = {type(m).__name__: m for m in UpdateProfileRequest.model_fields[field].metadata}
+        assert body[field]["minLength"] == constraints["MinLen"].min_length, field
+        assert body[field]["maxLength"] == constraints["MaxLen"].max_length, field
+
+
+def test_notification_responses_expose_no_delivery_bookkeeping_or_device_token() -> None:
+    for model in (NotificationOut, UserProfile):
+        leaked = {"sent_at", "retry_count", "user_id", "fcm_token", "device_token"} & set(model.model_fields)
+        assert not leaked, f"{model.__name__} exposes {sorted(leaked)}"
+
+
+# ── Admin ───────────────────────────────────────────────────────────────
+
+ADMIN_OPERATIONS = [(p, m, op) for p, m, op in _operations() if p.startswith("/admin/")]
+
+
+def test_admin_surface_is_what_is_implemented() -> None:
+    """Pinned so an admin route cannot be added to one side and not the other."""
+    assert {(m, p) for p, m, _ in ADMIN_OPERATIONS} == {
+        ("get", "/admin/authority-users"),
+        ("post", "/admin/authority-users"),
+        ("patch", "/admin/authority-users/{user_id}/deactivate"),
+        ("get", "/admin/departments"),
+        ("post", "/admin/departments"),
+        ("patch", "/admin/departments/{department_id}"),
+        ("get", "/admin/zones"),
+        ("post", "/admin/zones"),
+        ("get", "/admin/system/stats"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("path", "method", "operation"), ADMIN_OPERATIONS, ids=[f"{m.upper()} {p}" for p, m, _ in ADMIN_OPERATIONS]
+)
+def test_admin_operations_require_a_bearer_token_and_document_401_403(
+    path: str, method: str, operation: dict[str, Any]
+) -> None:
+    assert operation.get("security") == [{"BearerAuth": []}], f"{method.upper()} {path}"
+    assert {"401", "403"} <= set(operation["responses"]), f"{method.upper()} {path}"
+
+
+def test_create_authority_requires_an_initial_password() -> None:
+    """No email delivery exists, so an account created without a password could never log in."""
+    assert "password" in COMPONENTS["CreateAuthorityRequest"]["required"]
+    assert CreateAuthorityRequest.model_fields["password"].is_required()
+
+
+def test_authority_user_carries_both_identifiers() -> None:
+    """`id` feeds assignIssue, `user_id` feeds deactivation; dropping either breaks a dashboard flow."""
+    assert {"id", "user_id"} <= set(COMPONENTS["AuthorityUser"]["required"])
+    deactivate = PATHS["/admin/authority-users/{user_id}/deactivate"]["patch"]
+    assert [p["name"] for p in deactivate["parameters"]] == ["user_id"]
+
+
+def test_geojson_polygon_type_enum_matches_contract() -> None:
+    assert COMPONENTS["GeoJSONPolygon"]["properties"]["type"]["enum"] == ["Polygon"]
+
+
+def test_department_thresholds_are_at_least_one_in_the_contract() -> None:
+    """D-1 / task 4.15a: neither threshold may be set below 1, on create or update."""
+    for component in ("CreateDepartmentRequest", "UpdateDepartmentRequest"):
+        for field in ("sla_hours", "upvote_alert_threshold"):
+            assert COMPONENTS[component]["properties"][field]["minimum"] == 1, f"{component}.{field}"
+            assert UpdateDepartmentRequest.model_fields[field].metadata, f"{field} has no bound on the model"
+
+
+# ── Analytics (task 1.29, SLA breaches, CSV export) ─────────────────────
+
+ANALYTICS_OPERATIONS = [(p, m, op) for p, m, op in _operations() if p.startswith("/analytics/")]
+
+
+def _contract_query_params(operation: dict[str, Any]) -> set[str]:
+    """Query parameter names of an operation, resolving `components.parameters` refs."""
+    shared = _spec["components"]["parameters"]
+    return {
+        (shared[p["$ref"].split("/")[-1]] if "$ref" in p else p)["name"]
+        for p in operation.get("parameters", [])
+        if (shared[p["$ref"].split("/")[-1]] if "$ref" in p else p)["in"] == "query"
+    }
+
+
+def test_all_five_analytics_operations_are_contracted() -> None:
+    assert {p for p, _, _ in ANALYTICS_OPERATIONS} == {
+        "/analytics/summary",
+        "/analytics/heatmap",
+        "/analytics/resolution-times",
+        "/analytics/sla-breaches",
+        "/analytics/export",
+    }
+
+
+@pytest.mark.parametrize(
+    ("path", "method", "operation"), ANALYTICS_OPERATIONS, ids=[p for p, _, _ in ANALYTICS_OPERATIONS]
+)
+def test_analytics_operations_are_staff_only(path: str, method: str, operation: dict[str, Any]) -> None:
+    assert operation.get("security") == [{"BearerAuth": []}], f"{method.upper()} {path}"
+    assert {"401", "403"} <= set(operation["responses"]), f"{method.upper()} {path}"
+
+
+@pytest.mark.parametrize(
+    ("path", "method", "operation"), ANALYTICS_OPERATIONS, ids=[p for p, _, _ in ANALYTICS_OPERATIONS]
+)
+def test_analytics_query_parameters_match_the_routes(path: str, method: str, operation: dict[str, Any]) -> None:
+    """The contract and the handler signatures must name the same query parameters."""
+    from app.main import create_app
+
+    generated = create_app().openapi()["paths"][f"/v1{path}"][method]
+    declared = {p["name"] for p in generated.get("parameters", []) if p["in"] == "query"}
+    assert _contract_query_params(operation) == declared
+
+
+def test_analytics_enums_match_contract() -> None:
+    export = PATHS["/analytics/export"]["get"]
+    assert [m.value for m in ExportFormat] == export["parameters"][0]["schema"]["enum"]
+    times = {p["name"]: p for p in PATHS["/analytics/resolution-times"]["get"]["parameters"] if "name" in p}
+    assert [m.value for m in ResolutionGroupBy] == times["group_by"]["schema"]["enum"]
+    assert [m.value for m in TrendInterval] == times["interval"]["schema"]["enum"]
+
+
+def test_pdf_export_is_documented_as_not_implemented() -> None:
+    """`pdf` stays in the enum (task 3.25 targets it) but is a documented 501, not a fake file."""
+    responses = PATHS["/analytics/export"]["get"]["responses"]
+    assert "501" in responses
+    assert "EXPORT_FORMAT_NOT_SUPPORTED" in responses["501"]["description"]
+    assert "text/csv" in responses["200"]["content"]
+
+
+def test_nullable_analytics_figures_are_still_required() -> None:
+    """A missing average is `null`, never an absent key and never 0."""
+    for field in ("avg_resolution_hours", "median_resolution_hours"):
+        assert field in COMPONENTS["AnalyticsSummary"]["required"]
+        assert COMPONENTS["AnalyticsSummary"]["properties"][field]["nullable"] is True
