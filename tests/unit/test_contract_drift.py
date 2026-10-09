@@ -58,7 +58,21 @@ from app.schemas.auth import (
     TokenType,
 )
 from app.schemas.common import ErrorDetail, ErrorResponse, HealthResponse, PaginatedResponse
-from app.schemas.issue import IssueStatus, IssueSummary
+from app.schemas.department import DepartmentSummary, DepartmentSummaryList
+from app.schemas.issue import (
+    AssignableStaff,
+    AssignableStaffList,
+    AssignIssueRequest,
+    CreateIssueResponse,
+    IssueDetail,
+    IssueImageOut,
+    IssueStatus,
+    IssueStatusHistoryEntry,
+    IssueSummary,
+    NearbyIssue,
+    UpdateIssueStatusRequest,
+    UpvoteResponse,
+)
 from app.schemas.notification import (
     MarkAllNotificationsReadResponse,
     NotificationChannel,
@@ -112,7 +126,6 @@ COMPONENT_CASES = [
     (AuthResponse, "AuthResponse"),
     (TokenResponse, "TokenResponse"),
     (UserProfile, "UserProfile"),
-    (PaginatedResponse, "PaginatedIssueResponse"),
     (ErrorResponse, "ErrorResponse"),
     (HealthResponse, "HealthResponse"),
     # Admin (tasks 1.11, 1.12, 4.15a)
@@ -145,6 +158,19 @@ COMPONENT_CASES = [
     (ResolutionTimesResponse, "ResolutionTimesResponse"),
     (SlaBreach, "SlaBreach"),
     (PaginatedResponse, "PaginatedSlaBreachResponse"),
+    # Issues — real handlers since 2026-09-09; required lists added with the
+    # staff-scope work (they were withheld while these backed mocks).
+    (CreateIssueResponse, "CreateIssueResponse"),
+    (IssueDetail, "IssueDetail"),
+    (IssueImageOut, "IssueImage"),
+    (IssueStatusHistoryEntry, "IssueStatusHistoryEntry"),
+    (NearbyIssue, "NearbyIssue"),
+    (UpvoteResponse, "UpvoteResponse"),
+    (AssignableStaff, "AssignableStaff"),
+    (AssignableStaffList, "AssignableStaffList"),
+    # Staff department read
+    (DepartmentSummary, "DepartmentSummary"),
+    (DepartmentSummaryList, "DepartmentSummaryList"),
 ]
 
 
@@ -206,6 +232,8 @@ INLINE_CASES = [
     (RefreshTokenRequest, "/auth/refresh", "post"),
     (UpdateProfileRequest, "/users/me", "patch"),
     (LogoutRequest, "/auth/logout", "post"),
+    (UpdateIssueStatusRequest, "/issues/{issue_id}/status", "patch"),
+    (AssignIssueRequest, "/issues/{issue_id}/assign", "patch"),
 ]
 
 
@@ -302,8 +330,10 @@ def test_refresh_token_is_taken_from_the_json_body(path: str, model: type) -> No
     assert PATHS[path]["post"]["requestBody"]["required"] is False
     body = _inline_body(path, "post")
     assert "required" not in body, f"{path}: a required list would turn the empty-body case into a 422"
-    assert set(model.model_fields) == {"refresh_token"}
-    assert not model.model_fields["refresh_token"].is_required()
+    # Logout also takes an optional `fcm_token`; the exact field sets are pinned
+    # by the INLINE_CASES tests. What matters here is that nothing is required.
+    assert "refresh_token" in model.model_fields
+    assert not any(field.is_required() for field in model.model_fields.values())
 
 
 NO_COOKIE_VOCABULARY = ["weft_refresh", "Set-Cookie", "HttpOnly", "httpOnly", "SameSite"]
@@ -590,3 +620,102 @@ def test_nullable_analytics_figures_are_still_required() -> None:
     for field in ("avg_resolution_hours", "median_resolution_hours"):
         assert field in COMPONENTS["AnalyticsSummary"]["required"]
         assert COMPONENTS["AnalyticsSummary"]["properties"][field]["nullable"] is True
+
+
+# ── Issues: responses, scope, staff picker, departments, rate limit ─────
+
+
+def _generated_operation(path: str, method: str) -> dict[str, Any]:
+    """The operation as the running app publishes it at /openapi.json."""
+    from app.main import create_app
+
+    return create_app().openapi()["paths"][f"/v1{path}"][method]
+
+
+def _generated_component(ref: str) -> dict[str, Any]:
+    """A component schema as the running app publishes it, by `$ref`."""
+    from app.main import create_app
+
+    return create_app().openapi()["components"]["schemas"][ref.split("/")[-1]]
+
+
+def test_issue_list_and_nearby_document_what_the_handlers_return() -> None:
+    """`GET /issues` returns summaries and `/nearby` a bare array — the contract once said otherwise for both."""
+    listing = PATHS["/issues"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert listing["$ref"] == "#/components/schemas/PaginatedIssueSummaryResponse"
+
+    nearby = PATHS["/issues/nearby"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert nearby["type"] == "array"
+    assert nearby["items"]["$ref"] == "#/components/schemas/NearbyIssue"
+
+
+def test_stale_issue_shapes_are_gone() -> None:
+    """`PaginatedIssueResponse` (items: IssueDetail) described no real endpoint; AI fields are cut (D-2)."""
+    assert "PaginatedIssueResponse" not in COMPONENTS
+    assert "PaginatedIssueResponse" not in OPENAPI_TEXT
+    for name in ("CreateIssueResponse", "IssueDetail", "IssueSummary", "NearbyIssue"):
+        stale = {f for f in COMPONENTS[name]["properties"] if f.startswith("ai_")}
+        assert not stale, f"{name} still documents {sorted(stale)}"
+
+
+@pytest.mark.parametrize("path", ["/issues", "/issues/nearby"])
+def test_issue_query_parameters_match_the_routes(path: str) -> None:
+    declared = {p["name"] for p in _generated_operation(path, "get").get("parameters", []) if p["in"] == "query"}
+    assert _contract_query_params(PATHS[path]["get"]) == declared
+
+
+def test_create_issue_form_matches_contract() -> None:
+    """`POST /issues` is multipart, so it has no model to pin; pin the route signature instead."""
+    body = _generated_operation("/issues", "post")["requestBody"]["content"]["multipart/form-data"]["schema"]
+    generated = _generated_component(body["$ref"])
+    contract = COMPONENTS["CreateIssueRequest"]
+    assert set(contract["properties"]) == set(generated["properties"])
+    assert set(contract["required"]) == set(generated["required"])
+
+
+STAFF_ISSUE_OPERATIONS = [
+    ("/issues/{issue_id}/status", "patch"),
+    ("/issues/{issue_id}/assign", "patch"),
+    ("/issues/{issue_id}/assignable-staff", "get"),
+]
+
+
+@pytest.mark.parametrize(("path", "method"), STAFF_ISSUE_OPERATIONS)
+def test_staff_issue_operations_answer_out_of_scope_with_the_not_found_404(path: str, method: str) -> None:
+    """Out of jurisdiction must read as "no such issue", never as a 403 that confirms it exists."""
+    operation = PATHS[path][method]
+    assert operation["security"] == [{"BearerAuth": []}]
+    assert operation["responses"]["404"] == {"$ref": "#/components/responses/IssueNotFoundOrOutOfScope"}
+    assert operation["responses"]["403"] == {"$ref": "#/components/responses/StaffOnly"}
+    assert "401" in operation["responses"]
+
+
+def test_assign_documents_the_ineligible_assignee_code() -> None:
+    assert "ASSIGNEE_NOT_ELIGIBLE" in PATHS["/issues/{issue_id}/assign"]["patch"]["responses"]["400"]["description"]
+
+
+def test_assignable_staff_exposes_no_contact_details() -> None:
+    """Every authority can read the picker; it identifies colleagues, it does not reach them."""
+    for fields in (set(AssignableStaff.model_fields), set(COMPONENTS["AssignableStaff"]["properties"])):
+        assert not fields & {"email", "phone", "employee_id", "user_id"}
+
+
+def test_staff_department_read_is_documented() -> None:
+    operation = PATHS["/departments"]["get"]
+    assert operation["security"] == [{"BearerAuth": []}]
+    assert {"401", "403"} <= set(operation["responses"])
+    schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
+    assert schema["$ref"] == "#/components/schemas/DepartmentSummaryList"
+
+
+def test_issue_submission_documents_the_429_and_retry_after() -> None:
+    too_many = PATHS["/issues"]["post"]["responses"]["429"]
+    assert "Retry-After" in too_many["headers"]
+    assert too_many["content"]["application/json"]["schema"]["$ref"] == "#/components/schemas/ErrorResponse"
+
+
+def test_logout_documents_the_optional_fcm_token() -> None:
+    """D-3: still no required field, so an absent or empty body stays a 204."""
+    body = _inline_body("/auth/logout", "post")
+    assert "fcm_token" in body["properties"]
+    assert "required" not in body

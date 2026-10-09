@@ -27,12 +27,14 @@ from app.config import settings
 from app.core.captcha import verify_captcha
 from app.core.exceptions import BadRequestError, ForbiddenError
 from app.core.permissions import Role, get_current_user, get_current_user_optional, require_role
-from app.dependencies import DBSession
+from app.dependencies import DBSession, RedisClient, enforce_issue_rate_limit
 from app.models.user import User
 from app.schemas.common import PaginatedResponse
 from app.schemas.issue import (
     DEFAULT_RADIUS_METRES,
     MAX_RADIUS_METRES,
+    AssignableStaff,
+    AssignableStaffList,
     AssignIssueRequest,
     CreateIssueResponse,
     IssueCategory,
@@ -44,7 +46,7 @@ from app.schemas.issue import (
     NearbyIssue,
     UpdateIssueStatusRequest,
 )
-from app.services import image_service, issue_service, notification_service
+from app.services import image_service, issue_service, notification_service, realtime_service
 
 logger = logging.getLogger(__name__)
 
@@ -96,11 +98,17 @@ def _to_summary(issue) -> IssueSummary:  # noqa: ANN001 — Issue ORM row
     "",
     response_model=CreateIssueResponse,
     status_code=status.HTTP_201_CREATED,
+    # Route-level, so a refused submission never reaches CAPTCHA, image
+    # decoding or the insert. 10/hour/user, 3/hour/IP anonymous, per TRD
+    # Section 6; fails open when Redis is down — see the dependency.
+    dependencies=[Depends(enforce_issue_rate_limit)],
     summary="Submit a civic issue",
 )
 async def create_issue(
     db: DBSession,
     current_user: OptionalUser,
+    background_tasks: BackgroundTasks,
+    redis: RedisClient,
     category: Annotated[IssueCategory, Form(description="Reported category")],
     latitude: Annotated[float, Form(ge=-90, le=90)],
     longitude: Annotated[float, Form(ge=-180, le=180)],
@@ -123,6 +131,10 @@ async def create_issue(
     Image failures do not roll back the report. A civic hazard that was reported
     with an unreadable photo is still a reported hazard, and discarding it would
     be the worse outcome; rejected files are counted in the response instead.
+
+    `issue.created` goes to the dashboard feed as a background task, so it is
+    published only once the submission has committed, and a Redis outage can
+    never fail the submission (see `app/core/events.py`).
     """
     files = [f for f in images if f is not None and f.filename]
     if len(files) > settings.MAX_IMAGES_PER_ISSUE:
@@ -165,6 +177,7 @@ async def create_issue(
         row = await issue_service.attach_image(db, issue_id=issue.id, file_path=result.file_path)
         stored.append(_to_image_out(row))
 
+    realtime_service.schedule_issue_created(background_tasks, redis, issue=_to_summary(issue))
     return CreateIssueResponse(
         issue_id=issue.id,
         issue_number=issue.issue_number,
@@ -286,12 +299,14 @@ async def update_issue_status(
     payload: UpdateIssueStatusRequest,
     current_user: AuthorityUserDep,
     background_tasks: BackgroundTasks,
+    redis: RedisClient,
 ) -> IssueDetail:
     """Authority triage. Illegal transitions are refused, not silently applied.
 
     The reporter's notification (task 1.21/1.25) is queued as a background
     task: it runs after the response, after the request session has committed,
-    and can never fail the status change. Anonymous issues notify nobody.
+    and can never fail the status change. Anonymous issues notify nobody. The
+    dashboard's `issue.status_changed` event is queued the same way.
     """
     issue = await issue_service.update_status(
         db,
@@ -301,7 +316,17 @@ async def update_issue_status(
         note=payload.note,
     )
     notification_service.schedule_status_change_notification(background_tasks, db, issue=issue, actor=current_user)
-    return await get_issue(db, issue_id)
+    detail = await get_issue(db, issue_id)
+    realtime_service.schedule_status_changed(
+        background_tasks,
+        redis,
+        issue=detail,
+        # History is newest first, so this is the row the transition just wrote.
+        previous_status=detail.status_history[0].previous_status if detail.status_history else None,
+        actor=current_user,
+        note=payload.note,
+    )
+    return detail
 
 
 # ── PATCH /issues/{id}/assign ───────────────────────────────────────────
@@ -313,15 +338,46 @@ async def assign_issue(
     issue_id: uuid.UUID,
     payload: AssignIssueRequest,
     current_user: AuthorityUserDep,
+    background_tasks: BackgroundTasks,
+    redis: RedisClient,
 ) -> IssueDetail:
-    """Assign to an authority staff member."""
+    """Assign to an authority staff member.
+
+    `issue.assigned` is published to the dashboard feed after commit.
+    """
     await issue_service.assign_issue(
         db,
         issue_id=issue_id,
         assigned_to_id=payload.assigned_to_id,
         actor=current_user,
     )
-    return await get_issue(db, issue_id)
+    detail = await get_issue(db, issue_id)
+    realtime_service.schedule_assigned(
+        background_tasks, redis, issue=detail, assigned_at=detail.assigned_at, actor=current_user
+    )
+    return detail
+
+
+# ── GET /issues/{id}/assignable-staff ───────────────────────────────────
+
+
+@router.get(
+    "/{issue_id}/assignable-staff",
+    response_model=AssignableStaffList,
+    summary="Staff this issue can be assigned to",
+)
+async def list_assignable_staff(
+    db: DBSession,
+    issue_id: uuid.UUID,
+    current_user: AuthorityUserDep,
+) -> AssignableStaffList:
+    """The assign control's picker: exactly the staff `PATCH /assign` would accept.
+
+    Same jurisdiction rule as the triage writes — an issue outside the caller's
+    zones is a 404, identical to a missing one.
+    """
+    rows = await issue_service.list_assignable_staff(db, issue_id=issue_id, actor=current_user)
+    return AssignableStaffList(items=[AssignableStaff.model_validate(row) for row in rows])
 
 
 # ── POST /issues/{id}/images  (still a Phase 0 mock) ────────────────────

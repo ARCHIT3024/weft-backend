@@ -38,7 +38,10 @@ localhost.
 The authority account is posted to the Public Works department and covers both
 demo zones, which are rectangles over central Bengaluru. A report submitted
 near `12.9716, 77.5946` lands in Central Zone; one far away gets no zone, so
-both the assigned and unassigned paths are easy to exercise.
+both the assigned and unassigned paths are easy to exercise. Triage is
+zone-scoped, so a no-zone report can be triaged only by the admin account — the
+authority sees it on the map but gets a 404 from the status and assign
+endpoints.
 
 ## Tests
 
@@ -81,6 +84,14 @@ category mapped to several departments. The seed maps each exactly once, but
 nothing enforces it — an unordered lookup could route identical submissions to
 different departments once an operator adds a second mapping.
 
+**Staff triage is zone-scoped, and out of scope is a 404.** An AUTHORITY may
+change status, assign, and list assignable staff only for issues in their
+`authority_zones`; an issue in no zone is ADMIN-only. Anything else gets the
+exact `NOT_FOUND` body a missing issue gets — not a 403, which would confirm
+the issue exists. The rule lives in `app/services/issue_access.py`; route every
+new per-issue staff action through `issue_service.get_issue_for_staff`. The
+public reads (`GET /issues`, `/nearby`, `/{id}`) are deliberately unscoped.
+
 **Uploaded images are not moderated.** `moderate_image()` in
 `app/services/image_service.py` is a deliberate no-op marking where AWS
 Rekognition would go. EXIF *is* stripped, which is a privacy requirement rather
@@ -104,6 +115,10 @@ tests/          unit/ needs no database; integration/ does
 `openapi.yaml` is the frozen contract. `tests/unit/test_contract_drift.py` pins
 the Pydantic models against it, so a schema change that is not reflected in the
 spec fails the build on purpose.
+
+OpenAPI cannot describe a WebSocket, so the realtime dashboard feed
+(`WS /v1/ws/dashboard`: auth handshake, close codes, heartbeat, and every event
+shape) is specified in [`docs/realtime.md`](docs/realtime.md) instead.
 
 ## Project docs
 

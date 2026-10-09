@@ -28,10 +28,16 @@ tags:
     description: Push & in-app notifications
   - name: Analytics
     description: Authority dashboard analytics
+  - name: Departments
+    description: Department configuration staff need to read (AUTHORITY or ADMIN)
   - name: Admin
     description: System administration (admin role)
   - name: WebSocket
-    description: Real-time dashboard events
+    description: >-
+      Real-time dashboard events over `WS /v1/ws/dashboard` (AUTHORITY / ADMIN
+      only). OpenAPI 3.0 cannot describe a WebSocket, so the protocol (auth
+      handshake as the first message, close codes, heartbeat, token expiry)
+      and every event shape are specified in `docs/realtime.md`.
   - name: Health
     description: Health check
 
@@ -224,6 +230,14 @@ paths:
         Idempotent by construction: an unknown token, an already-revoked
         token, an empty body and no body at all all return 204, so the
         response is never an oracle for which tokens exist.
+
+        An optional `fcm_token` unregisters this device from push
+        notifications in the same transaction, so a logged-out phone stops
+        receiving the previous user's pushes. It is acted on only when
+        `refresh_token` is an unrevoked token of the account that FCM token is
+        registered to; otherwise it is silently ignored — an unauthenticated
+        caller cannot unregister somebody else's device, and the response
+        does not say which case occurred.
       operationId: logout
       requestBody:
         required: false
@@ -237,6 +251,12 @@ paths:
                   description: >-
                     Refresh token to revoke. Omitting it is not an error — the
                     call succeeds and revokes nothing.
+                fcm_token:
+                  type: string
+                  description: >-
+                    This device's FCM registration token. Deleted only if it
+                    belongs to the owner of the refresh token this call
+                    revokes; ignored otherwise.
       responses:
         "204":
           description: >-
@@ -248,6 +268,17 @@ paths:
     post:
       tags: [Issues]
       summary: Submit a new civic issue
+      description: >-
+        Authentication is optional: an anonymous report is stored with no
+        reporter. CAPTCHA is required for anonymous submissions when the
+        server has a reCAPTCHA key configured.
+
+        Rate limited before anything else runs: 10 submissions per hour per
+        signed-in user, 3 per hour per client IP when anonymous (a missing,
+        invalid or deactivated token counts as anonymous). The limit fails
+        open — if the rate-limit store is unavailable, submissions are
+        accepted. A global per-IP limit is enforced at the load balancer, not
+        by this API.
       operationId: createIssue
       security:
         - BearerAuth: []
@@ -265,8 +296,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CreateIssueResponse"
+        "400":
+          description: >-
+            TOO_MANY_IMAGES, CAPTCHA_REQUIRED (anonymous, no captcha_token) or
+            CAPTCHA_FAILED
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "429":
-          description: Rate limit exceeded
+          description: >-
+            RATE_LIMIT_EXCEEDED. `details` carries `limit`, `window` and
+            `retry_after_seconds`; the same wait is sent as `Retry-After`.
+          headers:
+            Retry-After:
+              description: Seconds until the caller may submit again (at least 1).
+              schema:
+                type: integer
+                minimum: 1
           content:
             application/json:
               schema:
@@ -275,17 +322,23 @@ paths:
     get:
       tags: [Issues]
       summary: List issues with filters
+      description: >-
+        Public — no authentication, and not scoped by zone: the citizen map
+        reads it. Items are `IssueSummary` (no photos, no audit trail); read
+        one issue for those. The spatial filter applies only when `lat`,
+        `lng` and `radius` are all given.
       operationId: listIssues
       parameters:
         - name: lat
           in: query
-          schema: { type: number, format: double }
+          schema: { type: number, format: double, minimum: -90, maximum: 90 }
         - name: lng
           in: query
-          schema: { type: number, format: double }
-        - name: radius_m
+          schema: { type: number, format: double, minimum: -180, maximum: 180 }
+        - name: radius
           in: query
-          schema: { type: integer, default: 2000, maximum: 10000 }
+          description: Radius in metres around (lat, lng).
+          schema: { type: integer, minimum: 1, maximum: 10000 }
         - name: category
           in: query
           schema: { type: array, items: { $ref: "#/components/schemas/IssueCategory" } }
@@ -310,11 +363,13 @@ paths:
         - name: page_size
           in: query
           schema: { type: integer, default: 20, minimum: 1, maximum: 100 }
-        - name: sort_by
+        - name: sort
           in: query
-          schema: { type: string, enum: [created_at, upvote_count], default: created_at }
-        - name: sort_dir
+          description: Any other value sorts by created_at.
+          schema: { type: string, enum: [created_at, updated_at, upvote_count, status], default: created_at }
+        - name: order
           in: query
+          description: Anything but `asc` sorts descending.
           schema: { type: string, enum: [asc, desc], default: desc }
       responses:
         "200":
@@ -322,32 +377,41 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PaginatedIssueResponse"
+                $ref: "#/components/schemas/PaginatedIssueSummaryResponse"
 
   /issues/nearby:
     get:
       tags: [Issues]
       summary: Get issues near a location
+      description: >-
+        Public. Issues within `radius` metres, nearest first, each carrying
+        its distance in metres on the spheroid. A plain array, not a page.
       operationId: nearbyIssues
       parameters:
         - name: lat
           in: query
           required: true
-          schema: { type: number, format: double }
+          schema: { type: number, format: double, minimum: -90, maximum: 90 }
         - name: lng
           in: query
           required: true
-          schema: { type: number, format: double }
-        - name: radius_m
+          schema: { type: number, format: double, minimum: -180, maximum: 180 }
+        - name: radius
           in: query
-          schema: { type: integer, default: 2000, maximum: 10000 }
+          description: Radius in metres.
+          schema: { type: integer, default: 2000, minimum: 1, maximum: 10000 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, minimum: 1, maximum: 200 }
       responses:
         "200":
-          description: Nearby issues with distance
+          description: Nearby issues with distance, nearest first
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PaginatedIssueResponse"
+                type: array
+                items:
+                  $ref: "#/components/schemas/NearbyIssue"
 
   /issues/{issue_id}:
     get:
@@ -365,11 +429,24 @@ paths:
                 $ref: "#/components/schemas/IssueDetail"
         "404":
           description: Issue not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /issues/{issue_id}/status:
     patch:
       tags: [Issues]
       summary: Update issue status (authority only)
+      description: >-
+        AUTHORITY or ADMIN. An AUTHORITY may change only issues in one of
+        their assigned zones; an issue outside every zone is ADMIN-only. Any
+        other issue is answered with the same 404 as a missing one, so this
+        endpoint cannot reveal that an issue exists in another zone.
+
+        Legal moves: REPORTED → IN_PROGRESS | RESOLVED | REJECTED;
+        IN_PROGRESS → RESOLVED | REJECTED; RESOLVED → IN_PROGRESS (reopen);
+        REJECTED is terminal. Moving to the current status is refused.
       operationId: updateIssueStatus
       security:
         - BearerAuth: []
@@ -395,13 +472,31 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/IssueDetail"
+        "400":
+          description: INVALID_STATUS_TRANSITION
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
-          description: Insufficient permissions
+          $ref: "#/components/responses/StaffOnly"
+        "404":
+          $ref: "#/components/responses/IssueNotFoundOrOutOfScope"
 
   /issues/{issue_id}/assign:
     patch:
       tags: [Issues]
       summary: Assign issue to field worker (authority only)
+      description: >-
+        AUTHORITY or ADMIN, under the same zone rule as status changes (an
+        out-of-scope issue is the same 404 as a missing one).
+
+        The assignee must be able to act on the issue themselves: an active
+        staff account whose zones include the issue's zone (an ADMIN's
+        profile covers every zone). `GET /issues/{issue_id}/assignable-staff`
+        lists exactly these people.
       operationId: assignIssue
       security:
         - BearerAuth: []
@@ -418,9 +513,56 @@ paths:
                 assigned_to_id:
                   type: string
                   format: uuid
+                  description: "`authority_users.id` of the assignee — an `AssignableStaff.id`"
       responses:
         "200":
           description: Issue assigned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssueDetail"
+        "400":
+          description: >-
+            ASSIGNEE_NOT_ELIGIBLE — the id is not an active staff profile whose
+            zones cover this issue (unknown ids included)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/StaffOnly"
+        "404":
+          $ref: "#/components/responses/IssueNotFoundOrOutOfScope"
+
+  /issues/{issue_id}/assignable-staff:
+    get:
+      tags: [Issues]
+      summary: Staff this issue can be assigned to
+      description: >-
+        AUTHORITY or ADMIN, under the same zone rule as status changes. Every
+        active staff member `PATCH /issues/{issue_id}/assign` would accept for
+        this issue, ordered by name. Minimal fields only — no email, phone or
+        employee id. Unpaginated.
+      operationId: listAssignableStaff
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IssueId"
+      responses:
+        "200":
+          description: Eligible assignees
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssignableStaffList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/StaffOnly"
+        "404":
+          $ref: "#/components/responses/IssueNotFoundOrOutOfScope"
 
   /issues/{issue_id}/images:
     post:
@@ -459,6 +601,10 @@ paths:
       responses:
         "201":
           description: Upvote recorded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpvoteResponse"
         "409":
           description: Already upvoted
 
@@ -879,6 +1025,32 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  # ── Departments (staff read) ────────────────────────────────────────
+  /departments:
+    get:
+      tags: [Departments]
+      summary: List departments (staff)
+      description: >-
+        AUTHORITY or ADMIN. Every department, active or not, ordered by code,
+        with the SLA the dashboard measures breaches against and the upvote
+        alert threshold. Not zone-scoped: departments are city-wide
+        configuration. The full record, and every write, is under
+        `/admin/departments` (ADMIN only).
+      operationId: listDepartmentsForStaff
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Every department
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DepartmentSummaryList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/StaffOnly"
+
   # ── Admin ───────────────────────────────────────────────────────────
   # Every admin operation requires an ADMIN access token: none is a 401, any
   # other role a 403. Validation failures not listed per operation are 422.
@@ -1235,6 +1407,28 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+    Unauthorized:
+      description: UNAUTHORIZED — missing, invalid or expired access token, or a deactivated account
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    StaffOnly:
+      description: FORBIDDEN — the caller is not AUTHORITY or ADMIN
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    IssueNotFoundOrOutOfScope:
+      description: >-
+        NOT_FOUND — no such issue, or (for an AUTHORITY) an issue outside
+        their zones, including one outside every zone. The two are
+        byte-identical by design, so the response never confirms that an
+        issue exists in someone else's jurisdiction.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
 
   schemas:
     # ── Enums ─────────────────────────────────────────────────────────
@@ -1339,13 +1533,13 @@ components:
     # ── Issues ────────────────────────────────────────────────────────
     CreateIssueRequest:
       type: object
-      required: [category, latitude, longitude, image]
+      # multipart/form-data, so there is no Pydantic model: the route declares
+      # these as Form/File parameters, and test_contract_drift.py pins this
+      # component against the route signature instead.
+      required: [category, latitude, longitude]
       properties:
         category:
           $ref: "#/components/schemas/IssueCategory"
-        description:
-          type: string
-          maxLength: 500
         latitude:
           type: number
           format: double
@@ -1356,62 +1550,90 @@ components:
           format: double
           minimum: -180
           maximum: 180
-        image:
+        description:
           type: string
-          format: binary
+          maxLength: 500
+        address_text:
+          type: string
+          maxLength: 500
         captcha_token:
           type: string
-          description: Required for anonymous submissions
-        captured_at:
-          type: string
-          format: date-time
-          description: When photo was captured (for offline submissions)
+          description: Required for anonymous submissions when the server has a reCAPTCHA key configured
+        images:
+          type: array
+          description: >-
+            Zero or more photos, repeating the `images` field. Each is
+            validated by content, EXIF-stripped and re-encoded; an unreadable
+            one is dropped without failing the report.
+          items:
+            type: string
+            format: binary
 
     CreateIssueResponse:
       type: object
+      # Mirrors app.schemas.issue.CreateIssueResponse. Required = the fields
+      # with no default.
+      required: [issue_id, issue_number, status, category, latitude, longitude, images, created_at]
       properties:
         issue_id:
           type: string
           format: uuid
         issue_number:
           type: string
-          example: "ISS-2025-00412"
+          example: "ISS-2026-K7QD3M8XPZ"
         status:
           $ref: "#/components/schemas/IssueStatus"
         category:
           $ref: "#/components/schemas/IssueCategory"
-        ai_suggested_category:
-          $ref: "#/components/schemas/IssueCategory"
-        ai_confidence:
-          type: number
-          format: double
-          minimum: 0
-          maximum: 1
         latitude:
           type: number
         longitude:
           type: number
         address_text:
           type: string
+          nullable: true
+        zone_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Zone assigned by point-in-polygon; null outside every zone
+        department_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Department the category routed to
         image_url:
           type: string
-          format: uri
+          nullable: true
+          description: URL of the first stored photo, if any
+        images:
+          type: array
+          description: Every photo stored with this submission
+          items:
+            $ref: "#/components/schemas/IssueImage"
         created_at:
           type: string
           format: date-time
 
     IssueDetail:
       type: object
+      # Mirrors app.schemas.issue.IssueDetail: IssueSummary's fields plus
+      # assigned_at, images and status_history. Required = the fields with no
+      # default.
+      required:
+        [id, issue_number, category, status, latitude, longitude, upvote_count, created_at, updated_at, images, status_history]
       properties:
         id:
           type: string
           format: uuid
         issue_number:
           type: string
+          example: "ISS-2026-K7QD3M8XPZ"
         category:
           $ref: "#/components/schemas/IssueCategory"
         description:
           type: string
+          nullable: true
         status:
           $ref: "#/components/schemas/IssueStatus"
         latitude:
@@ -1420,25 +1642,20 @@ components:
           type: number
         address_text:
           type: string
+          nullable: true
+        upvote_count:
+          type: integer
         zone_id:
           type: string
           format: uuid
+          nullable: true
         department_id:
           type: string
           format: uuid
-        ai_suggested_category:
-          $ref: "#/components/schemas/IssueCategory"
-        ai_confidence:
-          type: number
-        upvote_count:
-          type: integer
+          nullable: true
         assigned_to_id:
           type: string
           format: uuid
-          nullable: true
-        assigned_at:
-          type: string
-          format: date-time
           nullable: true
         resolved_at:
           type: string
@@ -1450,20 +1667,35 @@ components:
         updated_at:
           type: string
           format: date-time
+        assigned_at:
+          type: string
+          format: date-time
+          nullable: true
         images:
           type: array
+          description: Report photos and resolution proofs, oldest first
           items:
             $ref: "#/components/schemas/IssueImage"
+        status_history:
+          type: array
+          description: Every transition, newest first
+          items:
+            $ref: "#/components/schemas/IssueStatusHistoryEntry"
 
     IssueImage:
       type: object
+      # Mirrors app.schemas.issue.IssueImageOut.
+      required: [id, cdn_url, image_type, created_at]
       properties:
         id:
           type: string
           format: uuid
         cdn_url:
           type: string
-          format: uri
+          description: >-
+            Where the client fetches the photo. Root-relative (`/media/...`)
+            while images are served from local disk; absolute once a CDN
+            serves them — resolve it against the API origin.
         image_type:
           type: string
           enum: [REPORT, RESOLUTION_PROOF]
@@ -1471,22 +1703,32 @@ components:
           type: string
           format: date-time
 
-    PaginatedIssueResponse:
+    IssueStatusHistoryEntry:
       type: object
-      required: [items, total, page, page_size, total_pages]
+      # Mirrors app.schemas.issue.IssueStatusHistoryEntry.
+      required: [id, new_status, created_at]
       properties:
-        items:
-          type: array
-          items:
-            $ref: "#/components/schemas/IssueDetail"
-        total:
-          type: integer
-        page:
-          type: integer
-        page_size:
-          type: integer
-        total_pages:
-          type: integer
+        id:
+          type: string
+          format: uuid
+        previous_status:
+          allOf:
+            - $ref: "#/components/schemas/IssueStatus"
+          nullable: true
+          description: Null on exactly one entry per issue — the opening REPORTED row
+        new_status:
+          $ref: "#/components/schemas/IssueStatus"
+        changed_by_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: "`users.id` of the actor; null for an anonymous submission or a deleted account"
+        note:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
 
     IssueSummary:
       type: object
@@ -1556,6 +1798,137 @@ components:
           type: integer
         total_pages:
           type: integer
+
+    NearbyIssue:
+      type: object
+      # Mirrors app.schemas.issue.NearbyIssue: IssueSummary plus distance_m.
+      required: [id, issue_number, category, status, latitude, longitude, upvote_count, created_at, updated_at, distance_m]
+      properties:
+        id:
+          type: string
+          format: uuid
+        issue_number:
+          type: string
+        category:
+          $ref: "#/components/schemas/IssueCategory"
+        description:
+          type: string
+          nullable: true
+        status:
+          $ref: "#/components/schemas/IssueStatus"
+        latitude:
+          type: number
+        longitude:
+          type: number
+        address_text:
+          type: string
+          nullable: true
+        upvote_count:
+          type: integer
+        zone_id:
+          type: string
+          format: uuid
+          nullable: true
+        department_id:
+          type: string
+          format: uuid
+          nullable: true
+        assigned_to_id:
+          type: string
+          format: uuid
+          nullable: true
+        resolved_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        distance_m:
+          type: number
+          minimum: 0
+          description: Distance from the query point in metres, on the spheroid
+
+    UpvoteResponse:
+      type: object
+      # Mirrors app.schemas.issue.UpvoteResponse.
+      required: [issue_id, user_id, upvote_count, created_at]
+      properties:
+        issue_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        upvote_count:
+          type: integer
+          description: The issue's total after this vote, as the database trigger computed it
+        created_at:
+          type: string
+          format: date-time
+
+    AssignableStaff:
+      type: object
+      # Mirrors app.schemas.issue.AssignableStaff. Readable by every authority,
+      # so deliberately minimal: no email, phone or employee id.
+      required: [id, department_name]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: "`authority_users.id` — the `assigned_to_id` to send to assignIssue"
+        name:
+          type: string
+          nullable: true
+        designation:
+          type: string
+          nullable: true
+        department_name:
+          type: string
+
+    AssignableStaffList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssignableStaff"
+
+    # ── Departments (staff read) ──────────────────────────────────────
+    DepartmentSummary:
+      type: object
+      # Mirrors app.schemas.department.DepartmentSummary — the staff-readable
+      # subset of the admin `Department` component.
+      required: [id, name, code, sla_hours, upvote_alert_threshold, is_active]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        code:
+          type: string
+        sla_hours:
+          type: integer
+          description: Resolution SLA in hours; an open issue older than this is in breach
+        upvote_alert_threshold:
+          type: integer
+          description: Upvote count at which an issue.high_upvote_alert is raised
+        is_active:
+          type: boolean
+
+    DepartmentSummaryList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/DepartmentSummary"
 
     # ── Users ─────────────────────────────────────────────────────────
     UserProfile:
