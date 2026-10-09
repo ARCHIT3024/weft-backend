@@ -8,6 +8,11 @@ Neither handler touches `issues.upvote_count`. That column is owned by the
 `trg_upvote_count` database trigger (migration 012) — see
 `app/services/issue_service.py` for why the counter is maintained there rather
 than in Python.
+
+Adding an upvote can publish `issue.high_upvote_alert` to the dashboard feed —
+once per issue, when the count reaches its department's
+`upvote_alert_threshold` (D-1). The "once" rule lives in
+`app/services/realtime_service.py::schedule_high_upvote_alert`.
 """
 
 from __future__ import annotations
@@ -16,13 +21,13 @@ import logging
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, BackgroundTasks, Depends, status
 
 from app.core.permissions import get_current_user
-from app.dependencies import DBSession
+from app.dependencies import DBSession, RedisClient
 from app.models.user import User
 from app.schemas.issue import UpvoteResponse
-from app.services import issue_service
+from app.services import issue_service, realtime_service
 
 logger = logging.getLogger(__name__)
 
@@ -37,16 +42,28 @@ CurrentUser = Annotated[User, Depends(get_current_user)]
     status_code=status.HTTP_201_CREATED,
     summary="Upvote an issue",
 )
-async def upvote_issue(db: DBSession, issue_id: uuid.UUID, current_user: CurrentUser) -> UpvoteResponse:
+async def upvote_issue(
+    db: DBSession,
+    issue_id: uuid.UUID,
+    current_user: CurrentUser,
+    background_tasks: BackgroundTasks,
+    redis: RedisClient,
+) -> UpvoteResponse:
     """Record this citizen's upvote.
 
     A second upvote from the same account is a `409`, enforced by the
     `(user_id, issue_id)` primary key rather than by a prior lookup — two
     concurrent requests both passing a "have they voted?" check is precisely
     the race that produces a double count.
+
+    If this vote lands the count exactly on the department's threshold, the
+    high-upvote alert is queued to publish after commit. `upvote_count` is
+    read back after the insert, because the trigger — not this handler — moved
+    it.
     """
     issue = await issue_service.add_upvote(db, issue_id=issue_id, user=current_user)
     upvoted_at = await issue_service.upvote_timestamp(db, issue_id=issue_id, user_id=current_user.id)
+    await realtime_service.schedule_high_upvote_alert(background_tasks, db, redis, issue=issue)
 
     return UpvoteResponse(
         issue_id=issue.id,
