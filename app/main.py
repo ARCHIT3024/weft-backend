@@ -12,7 +12,7 @@ from redis.asyncio import ConnectionPool, Redis
 
 from app.config import settings
 from app.core.exceptions import WeftException, weft_exception_handler
-from app.routers import admin, analytics, auth, issues, notifications, upvotes, users, websocket
+from app.routers import admin, analytics, auth, departments, issues, notifications, upvotes, users, websocket
 from app.schemas.common import HealthResponse
 
 logger = logging.getLogger(__name__)
@@ -127,6 +127,7 @@ def create_app() -> FastAPI:
     app.include_router(notifications.router, prefix=f"{api_prefix}/notifications", tags=["Notifications"])
     app.include_router(analytics.router, prefix=f"{api_prefix}/analytics", tags=["Analytics"])
     app.include_router(admin.router, prefix=f"{api_prefix}/admin", tags=["Admin"])
+    app.include_router(departments.router, prefix=f"{api_prefix}/departments", tags=["Departments"])
     app.include_router(websocket.router, prefix=f"{api_prefix}/ws", tags=["WebSocket"])
 
     return app

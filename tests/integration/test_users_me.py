@@ -27,6 +27,7 @@ from app.core.security import create_access_token
 from app.models.fcm_token import FcmToken
 from app.models.user import User
 from app.services.user_service import MAX_DEVICE_TOKENS_PER_USER
+from tests.integration.staff_helpers import authority_for_issue
 
 LAT, LNG = 12.9716, 77.5946
 
@@ -323,9 +324,9 @@ class TestMyReports:
 
     async def test_status_filter(self, client: AsyncClient, db_session: AsyncSession) -> None:
         me = await _user(db_session)
-        authority = await _user(db_session, role="AUTHORITY")
         open_issue = await _submit(client, me)
         done = await _submit(client, me)
+        authority = await authority_for_issue(db_session, done["issue_id"])
         await client.patch(
             f"/v1/issues/{done['issue_id']}/status", json={"status": "RESOLVED"}, headers=_auth(authority)
         )

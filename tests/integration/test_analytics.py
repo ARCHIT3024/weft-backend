@@ -712,7 +712,7 @@ class TestResolutionTimes:
             "/v1/issues", data={"category": "POTHOLE", "latitude": "12.9716", "longitude": "77.5946"}
         )
         issue_id = submitted.json()["issue_id"]
-        triage = _auth(await _user(db_session, "AUTHORITY"))
+        triage = _auth(await _authority(db_session, [zone_id]))
         for target in ("RESOLVED", "IN_PROGRESS", "RESOLVED"):
             moved = await client.patch(f"/v1/issues/{issue_id}/status", json={"status": target}, headers=triage)
             assert moved.status_code == 200, moved.text

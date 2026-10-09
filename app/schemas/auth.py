@@ -156,6 +156,17 @@ class LogoutRequest(BaseModel):
         default=None,
         description="Refresh token to revoke; omitting it succeeds and revokes nothing",
     )
+    # Without this, a logged-out phone kept receiving the previous user's
+    # pushes: its registration token stayed attached to them until another
+    # account claimed it. Optional and silent like everything else here — it
+    # is acted on only alongside a refresh token this call actually revokes.
+    # No length bound, unlike on `PATCH /users/me`: it is only ever compared,
+    # never stored, and a 422 here would break "logout always answers 204".
+    fcm_token: str | None = Field(
+        default=None,
+        description="This device's FCM registration token, to stop push delivery to it. Ignored unless "
+        "`refresh_token` is a live token of the account the FCM token is registered to.",
+    )
 
 
 # ── Responses ───────────────────────────────────────────────────────────

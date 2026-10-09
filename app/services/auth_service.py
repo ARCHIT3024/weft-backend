@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +34,7 @@ from app.core.security import (
     hash_refresh_token,
     verify_password,
 )
+from app.models.fcm_token import FcmToken
 from app.models.refresh_token import RefreshToken
 from app.models.user import User
 from app.schemas.auth import RegisterRequest
@@ -190,22 +191,38 @@ async def rotate_refresh_token(db: AsyncSession, raw_token: str) -> tuple[str, s
     return await issue_token_pair(db, user)
 
 
-async def revoke_refresh_token(db: AsyncSession, raw_token: str | None) -> None:
+async def revoke_refresh_token(db: AsyncSession, raw_token: str | None, fcm_token: str | None = None) -> None:
     """Revoke a refresh token if it exists; do nothing otherwise.
 
     Intentionally silent about the outcome. Logout must be idempotent and must
     not become an oracle for which tokens exist, so an unknown token, an
     already-revoked token and an absent token are all indistinguishable to the
     caller.
+
+    When `fcm_token` is given, that device registration is deleted too — but
+    only if it belongs to the account whose refresh token *this call* revoked.
+    Logout is unauthenticated (D-3); the live refresh token is the only proof of
+    who is calling. So an unknown or already-revoked refresh token makes the
+    FCM token ignored, and a live refresh token cannot unregister somebody
+    else's device. Same transaction as the revocation, so the device stops
+    receiving this user's pushes exactly when the session ends.
+
+    An expired-but-unrevoked refresh token still counts: it identifies its
+    owner as well as a live one, and "the app logged out because the session
+    expired" is precisely when the phone should stop getting pushes.
     """
     if not raw_token:
         return
 
-    await db.execute(
+    revoked_for = await db.scalar(
         update(RefreshToken)
         .where(
             RefreshToken.token_hash == hash_refresh_token(raw_token),
             RefreshToken.is_revoked.is_(False),
         )
         .values(is_revoked=True)
+        .returning(RefreshToken.user_id)
     )
+
+    if revoked_for is not None and fcm_token:
+        await db.execute(delete(FcmToken).where(FcmToken.device_token == fcm_token, FcmToken.user_id == revoked_for))

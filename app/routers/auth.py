@@ -186,5 +186,13 @@ async def logout(db: DBSession, payload: LogoutRequest | None = None) -> None:
 
     Idempotent by construction: unknown, already-revoked and absent tokens all
     return 204, so the response is never an oracle for which tokens exist.
+
+    An optional `fcm_token` unregisters this device from push in the same
+    transaction — only when it belongs to the account whose refresh token was
+    just revoked, so an anonymous caller cannot unregister anyone else's phone.
     """
-    await auth_service.revoke_refresh_token(db, payload.refresh_token if payload else None)
+    await auth_service.revoke_refresh_token(
+        db,
+        payload.refresh_token if payload else None,
+        fcm_token=payload.fcm_token if payload else None,
+    )

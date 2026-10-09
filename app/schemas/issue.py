@@ -2,8 +2,12 @@
 
 Derived from the frozen OpenAPI contract (`openapi.yaml`) component schemas
 `CreateIssueRequest`, `CreateIssueResponse`, `IssueSummary`, `IssueDetail`,
-`NearbyIssue`, `IssueImage`, `IssueStatusHistoryEntry` and `UpvoteResponse`,
-plus the inline request bodies of `updateIssueStatus` and `assignIssue`.
+`NearbyIssue`, `IssueImage`, `IssueStatusHistoryEntry`, `UpvoteResponse`,
+`AssignableStaff` and `AssignableStaffList`, plus the inline request bodies of
+`updateIssueStatus` and `assignIssue`. Every response model and both inline
+bodies are pinned field-for-field, `required` list included, by
+`tests/unit/test_contract_drift.py`; `CreateIssueRequest` is a multipart form,
+not a model, and is pinned against the route signature instead.
 
 Two deliberate departures from the Phase 0 contract text, both made when the
 mock handlers were replaced with real ones (2026-09-08):
@@ -72,7 +76,7 @@ class IssueStatus(StrEnum):
 
     Mirrors `components.schemas.IssueStatus` and the `issue_status` Postgres
     enum. Which moves between these are legal is not expressible here — see
-    `app.services.issue_service.LEGAL_STATUS_TRANSITIONS`.
+    `app.services.issue_service.LEGAL_TRANSITIONS`.
     """
 
     REPORTED = "REPORTED"
@@ -256,6 +260,32 @@ class CreateIssueResponse(BaseModel):
     image_url: str | None = Field(default=None, description="URL of the first stored photo, if any")
     images: list[IssueImageOut] = Field(description="Every photo stored with this submission")
     created_at: datetime = Field(description="ISO 8601 submission timestamp")
+
+
+class AssignableStaff(BaseModel):
+    """One colleague the caller may assign an issue to.
+
+    Mirrors `components.schemas.AssignableStaff`. Deliberately minimal: every
+    authority can read this, not only admins, so it carries what identifies a
+    colleague in a picker and nothing that reaches them — no email, no phone,
+    no employee id. `id` is the value `PATCH /issues/{id}/assign` takes.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID = Field(description="`authority_users.id` — the `assigned_to_id` to send to the assign endpoint")
+    name: str | None = Field(default=None, description="Display name")
+    designation: str | None = Field(default=None, description="Job title, e.g. 'Assistant Engineer'")
+    department_name: str = Field(description="Department the staff member is posted to")
+
+
+class AssignableStaffList(BaseModel):
+    """Everyone the assign endpoint would accept for one issue, by name.
+
+    Mirrors `components.schemas.AssignableStaffList`.
+    """
+
+    items: list[AssignableStaff]
 
 
 class UpvoteResponse(BaseModel):

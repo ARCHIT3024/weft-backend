@@ -36,6 +36,7 @@ from app.models.fcm_token import FcmToken
 from app.models.notification import Notification
 from app.models.user import User
 from app.services import notification_service
+from tests.integration.staff_helpers import authority_for_issue, grant_jurisdiction
 
 LAT, LNG = 12.9716, 77.5946
 
@@ -338,7 +339,7 @@ class TestStatusChangeNotification:
         reporter = await _user(db_session)
         token = await _token(db_session, reporter)
         issue = await _submit(client, reporter, address_text="MG Road")
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, issue["issue_id"])
 
         response = await client.patch(
             f"/v1/issues/{issue['issue_id']}/status", json={"status": "IN_PROGRESS"}, headers=_auth(authority)
@@ -372,7 +373,7 @@ class TestStatusChangeNotification:
     ) -> None:
         reporter = await _user(db_session)
         issue = await _submit(client, reporter)
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, issue["issue_id"])
         await client.patch(
             f"/v1/issues/{issue['issue_id']}/status", json={"status": "RESOLVED"}, headers=_auth(authority)
         )
@@ -396,7 +397,7 @@ class TestStatusChangeNotification:
     ) -> None:
         reporter = await _user(db_session)
         issue = await _submit(client, reporter, category="WATER_LOGGING")
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, issue["issue_id"])
         await client.patch(
             f"/v1/issues/{issue['issue_id']}/status", json={"status": new_status}, headers=_auth(authority)
         )
@@ -407,7 +408,7 @@ class TestStatusChangeNotification:
     ) -> None:
         reporter = await _user(db_session)
         issue = await _submit(client, reporter)
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, issue["issue_id"])
         await client.patch(
             f"/v1/issues/{issue['issue_id']}/status", json={"status": "IN_PROGRESS"}, headers=_auth(authority)
         )
@@ -421,7 +422,7 @@ class TestStatusChangeNotification:
         self, client: AsyncClient, db_session: AsyncSession, sender: RecordingSender
     ) -> None:
         issue = await _submit(client, None)
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, issue["issue_id"])
 
         response = await client.patch(
             f"/v1/issues/{issue['issue_id']}/status", json={"status": "IN_PROGRESS"}, headers=_auth(authority)
@@ -439,9 +440,11 @@ class TestStatusChangeNotification:
     ) -> None:
         authority = await _user(db_session, role="AUTHORITY")
         issue = await _submit(client, authority)
-        await client.patch(
+        await grant_jurisdiction(db_session, authority, issue["issue_id"])
+        response = await client.patch(
             f"/v1/issues/{issue['issue_id']}/status", json={"status": "IN_PROGRESS"}, headers=_auth(authority)
         )
+        assert response.status_code == 200, response.text
         assert await _notifications_for(db_session, authority) == []
 
     async def test_illegal_transition_notifies_nobody(
@@ -449,7 +452,7 @@ class TestStatusChangeNotification:
     ) -> None:
         reporter = await _user(db_session)
         issue = await _submit(client, reporter)
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, issue["issue_id"])
 
         response = await client.patch(
             f"/v1/issues/{issue['issue_id']}/status", json={"status": "REPORTED"}, headers=_auth(authority)
@@ -466,7 +469,7 @@ class TestStatusChangeNotification:
         issue = await _submit(client, reporter)
         reporter.is_active = False
         await db_session.flush()
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, issue["issue_id"])
 
         response = await client.patch(
             f"/v1/issues/{issue['issue_id']}/status", json={"status": "IN_PROGRESS"}, headers=_auth(authority)
@@ -484,7 +487,7 @@ class TestStatusChangeNotification:
         token = await _token(db_session, reporter)
         sender.outcomes[token] = PushResult(outcome=PushOutcome.FAILED, attempts=3, error="HTTP 503")
         issue = await _submit(client, reporter)
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, issue["issue_id"])
 
         response = await client.patch(
             f"/v1/issues/{issue['issue_id']}/status", json={"status": "RESOLVED"}, headers=_auth(authority)
@@ -504,7 +507,7 @@ class TestStatusChangeNotification:
         await _token(db_session, reporter)
         sender.raise_error = RuntimeError("boom")
         issue = await _submit(client, reporter)
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, issue["issue_id"])
 
         response = await client.patch(
             f"/v1/issues/{issue['issue_id']}/status", json={"status": "IN_PROGRESS"}, headers=_auth(authority)
@@ -525,7 +528,7 @@ class TestStatusChangeNotification:
         reporter = await _user(db_session)
         await _token(db_session, reporter)
         issue = await _submit(client, reporter)
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, issue["issue_id"])
 
         response = await client.patch(
             f"/v1/issues/{issue['issue_id']}/status", json={"status": "IN_PROGRESS"}, headers=_auth(authority)

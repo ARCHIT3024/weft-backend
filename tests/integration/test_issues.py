@@ -36,6 +36,7 @@ from app.core.security import create_access_token
 from app.models.department import Department
 from app.models.issue import Issue
 from app.models.user import User
+from tests.integration.staff_helpers import authority_for_issue
 
 # Inside "Central Zone" as created by `_zone` below.
 LAT, LNG = 12.9716, 77.5946
@@ -363,7 +364,7 @@ class TestUpvotes:
 class TestStatusTransitions:
     async def test_authority_can_start_work(self, client: AsyncClient, db_session: AsyncSession) -> None:
         body = await _submit(client)
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, body["issue_id"])
 
         response = await client.patch(
             f"/v1/issues/{body['issue_id']}/status",
@@ -375,7 +376,7 @@ class TestStatusTransitions:
 
     async def test_transition_is_recorded_in_history(self, client: AsyncClient, db_session: AsyncSession) -> None:
         body = await _submit(client)
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, body["issue_id"])
 
         await client.patch(
             f"/v1/issues/{body['issue_id']}/status",
@@ -393,7 +394,7 @@ class TestStatusTransitions:
 
     async def test_resolving_sets_resolved_at(self, client: AsyncClient, db_session: AsyncSession) -> None:
         body = await _submit(client)
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, body["issue_id"])
 
         response = await client.patch(
             f"/v1/issues/{body['issue_id']}/status",
@@ -405,7 +406,7 @@ class TestStatusTransitions:
     async def test_reopening_clears_resolved_at(self, client: AsyncClient, db_session: AsyncSession) -> None:
         """A stale resolved_at would corrupt resolution-time analytics."""
         body = await _submit(client)
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, body["issue_id"])
         headers = _auth(authority)
 
         await client.patch(f"/v1/issues/{body['issue_id']}/status", json={"status": "RESOLVED"}, headers=headers)
@@ -419,7 +420,7 @@ class TestStatusTransitions:
 
     async def test_rejected_is_terminal(self, client: AsyncClient, db_session: AsyncSession) -> None:
         body = await _submit(client)
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, body["issue_id"])
         headers = _auth(authority)
 
         await client.patch(f"/v1/issues/{body['issue_id']}/status", json={"status": "REJECTED"}, headers=headers)
@@ -431,7 +432,7 @@ class TestStatusTransitions:
 
     async def test_resolved_cannot_jump_back_to_reported(self, client: AsyncClient, db_session: AsyncSession) -> None:
         body = await _submit(client)
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, body["issue_id"])
         headers = _auth(authority)
 
         await client.patch(f"/v1/issues/{body['issue_id']}/status", json={"status": "RESOLVED"}, headers=headers)
@@ -445,7 +446,7 @@ class TestStatusTransitions:
     ) -> None:
         """Otherwise the audit trail fills with rows recording nothing."""
         body = await _submit(client)
-        authority = await _user(db_session, role="AUTHORITY")
+        authority = await authority_for_issue(db_session, body["issue_id"])
         response = await client.patch(
             f"/v1/issues/{body['issue_id']}/status",
             json={"status": "REPORTED"},

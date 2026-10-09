@@ -3,7 +3,7 @@
 The routers stay thin: they translate HTTP into these calls and back. Every
 query that touches PostGIS or the status machine lives here.
 
-Four properties this module exists to guarantee:
+Five properties this module exists to guarantee:
 
 * **Submission never silently loses routing.** Every issue gets a zone
   (point-in-polygon) and a department (category lookup) resolved at write time,
@@ -17,6 +17,9 @@ Four properties this module exists to guarantee:
 * **`issues.location` is never written.** It is a STORED GENERATED column
   derived from `longitude`/`latitude`, so writing it is not merely redundant,
   it is rejected by PostgreSQL.
+* **Triage is scoped to jurisdiction.** An AUTHORITY changes status, assigns
+  and lists assignable staff only for issues in their own zones; anything else
+  is the same 404 as a missing issue. The rule lives in `issue_access`.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
 from geoalchemy2 import Geography
 from sqlalchemy import Select, delete, func, select
@@ -44,6 +48,7 @@ from app.models.issue_status_history import IssueStatusHistory
 from app.models.upvote import Upvote
 from app.models.user import User
 from app.models.zone import Zone
+from app.services import issue_access
 
 logger = logging.getLogger(__name__)
 
@@ -401,6 +406,27 @@ async def find_nearby(
 
 
 # ── Triage ──────────────────────────────────────────────────────────────
+#
+# Every staff action on one issue goes through `get_issue_for_staff`, so the
+# jurisdiction rule (`issue_access`) is checked before anything else is — before
+# the status machine, before the assignee lookup. Checked any later, a 400 from
+# either would confirm that an out-of-scope issue exists.
+
+
+async def get_issue_for_staff(db: AsyncSession, issue_id: uuid.UUID, actor: User) -> Issue:
+    """Return an issue `actor` may act on, or raise the same 404 as a missing one.
+
+    Raises:
+        NotFoundError: no such issue, **or** it lies outside the actor's
+            jurisdiction. Identical on purpose — see `app.services.issue_access`.
+    """
+    issue = await get_issue(db, issue_id)
+    if not await issue_access.can_act_on(db, actor, issue.zone_id):
+        # Logged, because the caller is told nothing: an authority probing
+        # other zones, or a dashboard pointed at the wrong zone, shows up here.
+        logger.info("Out-of-scope issue action refused issue_id=%s zone=%s by=%s", issue.id, issue.zone_id, actor.id)
+        raise NotFoundError("Issue")
+    return issue
 
 
 async def update_status(
@@ -414,13 +440,13 @@ async def update_status(
     """Move an issue to `new_status`, recording the transition.
 
     Raises:
-        NotFoundError: no such issue.
+        NotFoundError: no such issue, or one outside the actor's jurisdiction.
         BadRequestError: the move is not in `LEGAL_TRANSITIONS`, including the
             no-op case of transitioning to the status the issue already has —
             which is rejected rather than ignored so the audit trail does not
             accumulate rows that record nothing happening.
     """
-    issue = await get_issue(db, issue_id)
+    issue = await get_issue_for_staff(db, issue_id, actor)
     previous = issue.status
 
     if new_status == previous:
@@ -472,12 +498,31 @@ async def assign_issue(
     assigned_to_id: uuid.UUID,
     actor: User,
 ) -> Issue:
-    """Assign an issue to an authority staff member."""
-    issue = await get_issue(db, issue_id)
+    """Assign an issue to an authority staff member.
 
-    assignee = await db.get(AuthorityUser, assigned_to_id)
-    if assignee is None:
-        raise NotFoundError("Authority user")
+    The assignee must be able to act on the issue themselves — an active staff
+    account whose jurisdiction covers its zone (`issue_access.eligible_assignees`).
+    An issue handed to someone who cannot see it would sit in nobody's queue.
+
+    Raises:
+        NotFoundError: no such issue, or one outside the actor's jurisdiction.
+        BadRequestError: `ASSIGNEE_NOT_ELIGIBLE` — the id is not an active
+            staff profile covering the issue's zone. An unknown id gets the
+            same answer: a separate 404 would be confusable with the issue's,
+            and would let a caller test which authority ids exist.
+    """
+    issue = await get_issue_for_staff(db, issue_id, actor)
+
+    eligible = await db.scalar(
+        issue_access.eligible_assignees(issue.zone_id).where(AuthorityUser.id == assigned_to_id).limit(1)
+    )
+    if eligible is None:
+        raise BadRequestError(
+            code="ASSIGNEE_NOT_ELIGIBLE",
+            message="That staff member cannot be assigned this issue: they are inactive, or the issue is "
+            "outside their zones.",
+            details={"assigned_to_id": str(assigned_to_id)},
+        )
 
     issue.assigned_to_id = assigned_to_id
     issue.assigned_at = datetime.now(UTC)
@@ -485,6 +530,20 @@ async def assign_issue(
 
     logger.info("Issue assigned issue_id=%s to=%s by=%s", issue.id, assigned_to_id, actor.id)
     return issue
+
+
+async def list_assignable_staff(db: AsyncSession, *, issue_id: uuid.UUID, actor: User) -> list[Any]:
+    """Everyone `assign_issue` would accept for this issue — the staff picker.
+
+    Unpaginated: a zone's staff is a handful of people, and the picker needs
+    all of them. Rows carry only the columns `issue_access.eligible_assignees`
+    selects.
+
+    Raises:
+        NotFoundError: no such issue, or one outside the actor's jurisdiction.
+    """
+    issue = await get_issue_for_staff(db, issue_id, actor)
+    return list((await db.execute(issue_access.eligible_assignees(issue.zone_id))).all())
 
 
 # ── Upvotes ─────────────────────────────────────────────────────────────

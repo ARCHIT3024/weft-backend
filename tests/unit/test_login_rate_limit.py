@@ -313,7 +313,8 @@ def test_client_ip_falls_back_when_the_transport_has_no_peer() -> None:
 
 
 async def test_other_auth_routes_are_not_rate_limited(client: AsyncClient, clock: FakeClock) -> None:
-    """Only task 1.3's budget is wired; the other three attach to endpoints that
-    do not exist yet and were deliberately left alone."""
+    """The login budget is login's alone. The issue-submission budgets are wired
+    to `POST /issues` (see `test_issue_rate_limit.py`); the global one belongs
+    at the load balancer."""
     for _ in range(LOGIN_RATE_LIMIT + 3):
         assert (await client.post("/v1/auth/oauth/google")).status_code == 200

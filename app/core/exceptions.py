@@ -77,11 +77,20 @@ class RateLimitError(WeftException):
             f"You have exceeded the maximum of {limit} requests per {window}.",
             {"limit": limit, "window": window, "retry_after_seconds": retry_after_seconds},
         )
+        # The standard header as well as the body field: HTTP clients, proxies
+        # and retry middleware read `Retry-After` (RFC 9110 §10.2.3) without
+        # knowing this API's error envelope.
+        self.headers = {"Retry-After": str(retry_after_seconds)}
 
 
 async def weft_exception_handler(request: Request, exc: WeftException) -> JSONResponse:
-    """Global handler for WeftException — returns structured error JSON."""
+    """Global handler for WeftException — returns structured error JSON.
+
+    Forwards `exc.headers` (None unless an exception sets them, as
+    `RateLimitError` does with `Retry-After`).
+    """
     return JSONResponse(
         status_code=exc.status_code,
         content=exc.detail,
+        headers=exc.headers,
     )

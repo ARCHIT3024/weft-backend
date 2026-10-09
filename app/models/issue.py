@@ -13,9 +13,12 @@ feature cut from the local MVP are omitted rather than left as dead NULLs:
 * `is_flagged`                            — image moderation is cut.
 * `captured_at`                           — offline capture/queue is cut.
 
-`upvote_count` IS kept (the map UI renders it) but nothing writes to it yet:
-there is no upvote endpoint and therefore no `upvotes` table and no sync
-trigger in the MVP.  It stays at its `0` default.
+`upvote_count` is a denormalised counter owned by the database: the
+`trg_upvote_count` trigger (migration 012) increments it on every `upvotes`
+INSERT and decrements it on every DELETE.  **Application code never writes
+it** — `issue_service` inserts and deletes `upvotes` rows and re-reads the
+counter, which stays correct under concurrent votes in a way a Python
+read-modify-write would not.
 
 `location` is a STORED generated column derived from `longitude`/`latitude`,
 so it can never drift from them and is never written by the application.  It
